@@ -47,8 +47,10 @@ PARALLELISM
 from __future__ import annotations
 
 import os
+import io
 import uuid
 import tempfile
+import contextlib
 import numpy as np
 from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -65,6 +67,25 @@ C0   = 299792458.0
 MU0  = 4.0e-7 * np.pi
 EPS0 = 1.0 / (MU0 * C0**2)
 
+# meshio.read() emits a stray blank line on every call. With one mesh read per
+# tuning step per objective evaluation that floods the console, so mesh I/O is
+# silenced by default. Set cavity2d.QUIET = False to see it again.
+QUIET = True
+
+
+@contextlib.contextmanager
+def _quiet(enabled=None):
+    """Swallow stdout (only) for the duration. stderr is left alone so genuine
+    warnings and tracebacks still reach you."""
+    if enabled is None:
+        enabled = QUIET
+    if not enabled:
+        yield
+        return
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
+
+
 def tmp_msh_path(prefix="cavity"):
     """Portable scratch .msh path. Uses the platform temp dir (%TEMP% on Windows,
     /tmp on Unix) instead of a hardcoded POSIX path, and includes the pid plus a
@@ -77,8 +98,16 @@ def tmp_msh_path(prefix="cavity"):
 # Any geometric classification tolerance must be comfortably larger than it.
 _BBOX_TOL = 1e-6
 
-SIGMA_COPPER = 5.8e7        # S/m
-SIGMA_AL_COMSOL     = 3.774e7
+# Conductivities (S/m). Q ~ sqrt(sigma), so a small sigma mismatch shows up as a
+# small-but-visible Q offset when cross-checking against another code. The
+# _COMSOL values are what COMSOL's built-in material library uses; match them if
+# you are comparing against a COMSOL model that picked materials from that library.
+SIGMA_COPPER = 5.8e7          # generic handbook copper
+SIGMA_AL     = 3.5e7          # generic handbook aluminium
+SIGMA_COPPER_COMSOL = 5.998e7 # COMSOL material library "Copper"
+SIGMA_AL_COMSOL     = 3.774e7 # COMSOL material library "Aluminum"
+#   3.774e7 / 3.5e7 = 1.0783 -> sqrt = 1.0384, i.e. COMSOL's aluminium gives Q
+#   about 3.8% higher (a few hundred at Q ~ 1e4) purely from the constant.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -385,8 +414,9 @@ def solve_cavity(spec: CavitySpec, n_modes: int = 6, f_target: float | None = No
     Returns dict with 'freqs' (Hz) and per-mode C / Q / A_part, sorted by frequency.
     """
     tmp = msh_path or tmp_msh_path("cavity")
-    diel_mats = build_mesh(spec, tmp, verbose=verbose)
-    mesh = skfem.Mesh.load(tmp)
+    with _quiet(QUIET and not verbose):   # QUIET=False or verbose=True -> show it
+        diel_mats = build_mesh(spec, tmp, verbose=verbose)
+        mesh = skfem.Mesh.load(tmp)
     if msh_path is None:                     # only clean up files we created
         try:
             os.remove(tmp)
