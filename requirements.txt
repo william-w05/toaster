@@ -1,0 +1,8 @@
+numpy
+scipy
+gmsh
+scikit-fem
+matplotlib
+meshio
+torch
+tqdm
