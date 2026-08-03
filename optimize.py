@@ -37,10 +37,12 @@ def generate_seeds(n):
     return seeds
 
 if __name__ == "__main__":
-    n_walkers = 8
+    n_walkers = 7
     seeds = generate_seeds(n_walkers)
+    seeds.append([0, 128.69404921, 4.6586204, 10.00004685, 6.95143154,
+                           6.73395772, 124.86872764, 123.77079161])
     best_params, best_value, chains_params, chains_values= mcmc.mcmc_minimize(
-        seeds, save_path=PATH, steps=10, n_walkers=n_walkers, tuning_steps=TUNING_STEPS, proposal_std=0.1
+        seeds, save_path=PATH, steps=10, n_walkers=n_walkers+1, tuning_steps=TUNING_STEPS, proposal_std=0.1
     )
 
     print(best_params, best_value)
