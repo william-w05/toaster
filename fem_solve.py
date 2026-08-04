@@ -195,14 +195,105 @@ class CavitySpec:
     mesh_size_min: float | None = None
     tag: str = ""            # free-form label carried through to the results
 
+    # ---- outer-shape hooks: everything else in build_mesh is shape-agnostic --
+    def add_outer(self, occ):
+        """Create the outer surface and return its tag."""
+        return occ.addRectangle(*self.outer.as_tuple())
+
+    def on_wall(self, pts):
+        """True if every sampled point of a curve lies on the OUTER boundary."""
+        x0, y0, x1, y1 = self.outer.bounds
+        tol = _BBOX_TOL + 1e-6 * max(self.outer.w, self.outer.h)
+        x, y = pts[:, 0], pts[:, 1]
+        return bool(np.all(np.abs(x - x0) < tol) or np.all(np.abs(x - x1) < tol) or
+                    np.all(np.abs(y - y0) < tol) or np.all(np.abs(y - y1) < tol))
+
+    @property
+    def extent(self):
+        """(xmin, ymin, xmax, ymax) of the outer shape, for plotting."""
+        return self.outer.bounds
+
+
+@dataclass
+class CylSpec:
+    """
+    Circular cross-section (an infinite cylinder in 2D). Interface-compatible with
+    CavitySpec, so solve_cavity / run_batch / plot_mesh take it unchanged.
+
+    Useful because the TM modes have closed forms -- see cylinder_analytic() --
+    which makes it the natural end-to-end check on f, C and Q together.
+
+    radius : metres.
+    metal / dielectric : optional Rect inclusions, exactly as in CavitySpec.
+    """
+    radius: float
+    center: tuple = (0.0, 0.0)
+    metal: list = field(default_factory=list)
+    dielectric: list = field(default_factory=list)
+    background: Material = field(default_factory=lambda: Material("vacuum"))
+    wall_material: Material = field(default_factory=lambda: Material("cu"))
+    metal_material: Material = field(default_factory=lambda: Material("cu"))
+    mesh_size: float = 0.004
+    mesh_size_min: float | None = None
+    tag: str = ""
+
+    def add_outer(self, occ):
+        cx, cy = self.center
+        return occ.addDisk(cx, cy, 0.0, self.radius, self.radius)
+
+    def on_wall(self, pts):
+        cx, cy = self.center
+        r = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+        tol = _BBOX_TOL + 1e-6 * self.radius
+        return bool(np.all(np.abs(r - self.radius) < tol))
+
+    @property
+    def extent(self):
+        cx, cy = self.center
+        R = self.radius
+        return (cx - R, cy - R, cx + R, cy + R)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # geometry + mesh
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_mesh(spec: CavitySpec, msh_path: str, verbose: bool = False):
+def _curve_samples(tag, n=7):
+    """n points spread along a curve, as an (n,3) array, for shape-agnostic
+    boundary classification."""
+    lo, hi = gmsh.model.getParametrizationBounds(1, tag)
+    ts = np.linspace(float(lo[0]), float(hi[0]), n)
+    return np.asarray(gmsh.model.getValue(1, tag, ts),
+                      dtype=np.float64).reshape(-1, 3)
+
+
+def cylinder_analytic(radius, sigma=SIGMA_COPPER, n=1, eps_r=1.0, mu_r=1.0):
+    """
+    Closed-form TM_0n of an empty circular cross-section -- the reference for
+    validating the solver on all three outputs at once.
+
+        k     = j_{0,n} / R,           f = c k / (2 pi sqrt(eps_r mu_r))
+        C     = 4 / j_{0,n}^2          (0.6917 for TM_01: the classic value)
+        Q     = mu0 c j_{0,n} / (2 R_s),   R_s = sqrt(omega mu0 / (2 sigma))
+
+    C follows from  int J0(kr) dA = 2 pi R^2 J1(j)/j  and  int J0^2 dA = pi R^2 J1(j)^2.
+    """
+    from scipy.special import jn_zeros
+    j0n = float(jn_zeros(0, n)[-1])
+    k = j0n / radius
+    f = C0 * k / (2.0 * np.pi * np.sqrt(eps_r * mu_r))
+    omega = 2.0 * np.pi * f
+    R_s = np.sqrt(omega * MU0 / (2.0 * sigma))
+    return {"f": f, "C": 4.0 / j0n**2, "Q": MU0 * C0 * j0n / (2.0 * R_s),
+            "j0n": j0n, "k": k, "R_s": R_s}
+
+
+def build_mesh(spec, msh_path: str, verbose: bool = False):
     """
     Build the geometry with OCC booleans and write a .msh.
+
+    Works for any spec that provides add_outer(occ) and on_wall(pts) --
+    CavitySpec (rectangle) and CylSpec (disk) both do.
 
     Physical groups created:
       surfaces : "background", and one per dielectric ("diel_0", "diel_1", ...)
@@ -219,7 +310,7 @@ def build_mesh(spec: CavitySpec, msh_path: str, verbose: bool = False):
         gmsh.model.add("cavity")
         occ = gmsh.model.occ
 
-        outer = occ.addRectangle(*spec.outer.as_tuple())
+        outer = spec.add_outer(occ)        # rectangle, disk, ...
         dom = [(2, outer)]
 
         # ---- setminus: cut the metal rectangles out of the cavity -----------
@@ -272,23 +363,18 @@ def build_mesh(spec: CavitySpec, msh_path: str, verbose: bool = False):
                 g = gmsh.model.addPhysicalGroup(2, tags)
                 gmsh.model.setPhysicalName(2, g, f"diel_{i}")
 
-        # boundaries: outer wall vs. cut-out (metal) walls, split by bounding box
+        # Boundaries: outer wall vs cut-out (metal) walls. Classified by SAMPLING
+        # POINTS ALONG EACH CURVE and asking the spec whether they lie on its outer
+        # boundary. A bounding-box test cannot do this for a disk (an arc's bbox is
+        # not the disk's), whereas point sampling is shape-agnostic.
         all_surf = bg_tags + [t for tags in diel_tags for t in tags]
         bnd = gmsh.model.getBoundary([(2, t) for t in all_surf],
                                      combined=True, oriented=False)
-        x0, y0 = spec.outer.x0, spec.outer.y0
-        x1, y1 = x0 + spec.outer.w, y0 + spec.outer.h
-        tol = _BBOX_TOL + 1e-6 * max(spec.outer.w, spec.outer.h)
         wall, metal = [], []
         for (d, t) in bnd:
             if d != 1:
                 continue
-            bb = gmsh.model.getBoundingBox(1, t)
-            on_wall = (abs(bb[0] - x0) < tol and abs(bb[3] - x0) < tol) or \
-                      (abs(bb[0] - x1) < tol and abs(bb[3] - x1) < tol) or \
-                      (abs(bb[1] - y0) < tol and abs(bb[4] - y0) < tol) or \
-                      (abs(bb[1] - y1) < tol and abs(bb[4] - y1) < tol)
-            (wall if on_wall else metal).append(t)
+            (wall if spec.on_wall(_curve_samples(t)) else metal).append(t)
         if wall:
             g = gmsh.model.addPhysicalGroup(1, wall); gmsh.model.setPhysicalName(1, g, "wall")
         if metal:
@@ -399,7 +485,7 @@ def _observables(mesh, element, basis, u, k0, spec, diel_mats):
 # single solve
 # ─────────────────────────────────────────────────────────────────────────────
 
-def solve_cavity(spec: CavitySpec, n_modes: int = 6, f_target: float | None = None,
+def solve_cavity(spec, n_modes: int = 6, f_target: float | None = None,
                  order: int = 2, msh_path: str | None = None, verbose: bool = False,
                  keep_fields: bool = False):
     """

@@ -248,6 +248,8 @@ def proposed_params_within_limits(proposal):
     # CENTRE TOAST HEIGHT: clears the wall at maximum displacement
     if proposal[6] > cy - 2 * gap0 * np.abs(np.tan(np.radians(theta))):
         okay = False
+    elif proposal[6] < 80:
+        okay = False
 
     # CENTRE TOAST WIDTH
     if proposal[4] < 3:

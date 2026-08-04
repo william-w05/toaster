@@ -45,10 +45,10 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
     """
     Draw the geometry from the spec alone -- no gmsh, no meshing. Instant, so use
     it as the fast feedback loop while building a layout.
-
+ 
     Metal (setminus) rectangles are hatched; dielectrics are filled and labelled
     with their eps_r. Centres are marked, since rectangles are specified by centre.
-
+ 
     zoom : None    -> show the whole cavity
            "metal" -> fit to the inclusions (useful when a small assembly sits in
                       a much larger cavity, where the whole view hides the detail)
@@ -56,11 +56,19 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
     created = ax is None
     if created:
         fig, ax = plt.subplots(figsize=(9, 6))
-
-    o = spec.outer
-    ax.add_patch(MplRect((o.x0 * MM, o.y0 * MM), o.w * MM, o.h * MM,
-                         facecolor="#eaf3fb", edgecolor="#1f4e79", lw=2.0, zorder=0))
-
+ 
+    if hasattr(spec, "radius"):                     # CylSpec
+        from matplotlib.patches import Circle as MplCircle
+        cx, cy = spec.center
+        ax.add_patch(MplCircle((cx * MM, cy * MM), spec.radius * MM,
+                               facecolor="#eaf3fb", edgecolor="#1f4e79",
+                               lw=2.0, zorder=0))
+    else:                                           # CavitySpec
+        o = spec.outer
+        ax.add_patch(MplRect((o.x0 * MM, o.y0 * MM), o.w * MM, o.h * MM,
+                             facecolor="#eaf3fb", edgecolor="#1f4e79",
+                             lw=2.0, zorder=0))
+ 
     for i, r in enumerate(spec.metal):
         ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
                              facecolor="#9aa5b1", edgecolor="#33404d", lw=1.4,
@@ -69,7 +77,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
             _label(ax, r, f"{r.name}  {r.w*MM:.1f}x{r.h*MM:.1f}", i)
-
+ 
     for i, (r, mat) in enumerate(spec.dielectric):
         ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
                              facecolor="#f6d9a0", edgecolor="#a8791f", lw=1.4,
@@ -78,7 +86,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
             _label(ax, r, f"{mat.name} $\\epsilon_r$={mat.eps_r:g}", i)
-
+ 
     if zoom == "metal" and (spec.metal or spec.dielectric):
         rs = list(spec.metal) + [r for r, _ in spec.dielectric]
         x0 = min(r.x0 for r in rs); x1 = max(r.x0 + r.w for r in rs)
@@ -87,25 +95,27 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
         ax.set_xlim(x0 * MM - pad, x1 * MM + pad)
         ax.set_ylim(y0 * MM - pad, y1 * MM + pad)
     else:
-        pad = 0.04 * max(o.w, o.h) * MM
-        ax.set_xlim(o.x0 * MM - pad, (o.x0 + o.w) * MM + pad)
-        ax.set_ylim(o.y0 * MM - pad, (o.y0 + o.h) * MM + pad)
+        ex0, ey0, ex1, ey1 = spec.extent
+        pad = 0.04 * max(ex1 - ex0, ey1 - ey0) * MM
+        ax.set_xlim(ex0 * MM - pad, ex1 * MM + pad)
+        ax.set_ylim(ey0 * MM - pad, ey1 * MM + pad)
     ax.set_aspect("equal")
     ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)")
     ax.grid(alpha=0.25, ls=":")
-    ax.set_title(title or f"geometry: {spec.tag or '(untagged)'}"
-                          f"   outer {o.w*MM:.1f} x {o.h*MM:.1f} mm"
+    ex0, ey0, ex1, ey1 = spec.extent
+    shape = (f"disk r={spec.radius*MM:.1f} mm" if hasattr(spec, "radius")
+             else f"outer {(ex1-ex0)*MM:.1f} x {(ey1-ey0)*MM:.1f} mm")
+    ax.set_title(title or f"geometry: {spec.tag or '(untagged)'}   {shape}"
                           f"   metal={len(spec.metal)}  diel={len(spec.dielectric)}")
     _overlap_warnings(spec, ax)
     if created and save:
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return ax
 
-
 def _overlap_warnings(spec, ax):
     """Flag rectangles that overlap or stick out -- the usual layout mistakes."""
     msgs = []
-    ox0, oy0, ox1, oy1 = spec.outer.bounds
+    ox0, oy0, ox1, oy1 = spec.extent
     rects = [(r, "metal") for r in spec.metal] + \
             [(r, "diel") for r, _ in spec.dielectric]
     for r, kind in rects:
@@ -123,7 +133,6 @@ def _overlap_warnings(spec, ax):
                 transform=ax.transAxes, va="top", ha="left", fontsize=8,
                 color="#a11", bbox=dict(fc="#ffecec", ec="#a11", alpha=0.9))
     return msgs
-
 
 def check_spec(spec, verbose=True):
     """Non-graphical version of the same checks. Returns a list of problems."""
@@ -154,10 +163,10 @@ def plot_mesh(spec, save=None, show_regions=True, lw=0.25, title=None):
     except OSError:
         pass
     p, t = m.p, m.t
-
+ 
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.triplot(p[0] * MM, p[1] * MM, t.T, lw=lw, color="#7a8b99", alpha=0.8)
-
+ 
     if show_regions:
         colors = ["#eaf3fb", "#f6d9a0", "#cfe8cf", "#f2c8c8", "#ded0ef"]
         names = ["background"] + [f"diel_{i}" for i in range(len(diel_mats))]
@@ -173,10 +182,11 @@ def plot_mesh(spec, save=None, show_regions=True, lw=0.25, title=None):
         if nm in m.boundaries:
             f = m.facets[:, m.boundaries[nm]]
             ax.plot(p[0][f] * MM, p[1][f] * MM, color=col, lw=1.8)
-
+ 
     ax.set_aspect("equal"); ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)")
     ax.set_title(title or f"mesh: {spec.tag or ''}  {t.shape[1]} elements  "
                           f"(blue = wall BC, red = cut-out/metal BC)")
+    ax.set_aspect("equal")
     if save:
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return ax
@@ -398,3 +408,25 @@ def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010,
     return cv.CavitySpec(
         outer=cv.Rect.from_center(0.0, 0.0, cavity_w, cavity_h, "cavity"),
         metal=metal, mesh_size=mesh_size, tag=tag, **kw)
+
+def rect_spec(width, height, tag="rect", mesh_size=0.001, wall_material=None):
+    """
+    Build a simple rectangular cavity spec with no internal features.
+    """
+    kw = {}
+    if wall_material is not None:
+        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
+    return cv.CavitySpec(
+        outer=cv.Rect.from_center(0.0, 0.0, width, height, "cavity"),
+        metal=[], mesh_size=mesh_size, tag=tag, **kw)
+
+def cyl_spec(radius, tag="cyl", mesh_size=0.001, wall_material=None):
+    """
+    Build a simple cylindrical cavity spec with no internal features.
+    """
+    kw = {}
+    if wall_material is not None:
+        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
+    return cv.CylSpec(
+        center=(0.0, 0.0), radius=radius, metal=[], mesh_size=mesh_size,
+        tag=tag, **kw)

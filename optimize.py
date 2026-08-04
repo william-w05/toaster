@@ -1,5 +1,4 @@
 import time
-from unicodedata import name
 import numpy as np
 
 import fem_solve as cv
@@ -22,7 +21,7 @@ def generate_seeds(n):
         while not found:
             # empirical bounds
             theta = np.random.uniform(0,70) # 40, 50
-            ch = np.random.uniform(0, 160) # 115, 160
+            ch = np.random.uniform(80, 160) # 115, 160
             dh = np.random.uniform(0.9 * ch, 1.1 * ch) # 10% from ch
             dw = np.random.uniform(3, 20) # 3, 7
             g1 = np.random.uniform(9, 11) #9.95, 10.05
@@ -37,12 +36,12 @@ def generate_seeds(n):
     return seeds
 
 if __name__ == "__main__":
-    n_walkers = 7
+    n_walkers = 8
     seeds = generate_seeds(n_walkers)
-    seeds.append([0, 128.69404921, 4.6586204, 10.00004685, 6.95143154,
-                           6.73395772, 124.86872764, 123.77079161])
+    seeds.append([0, 125, 5, 10, 6, 6, 125, 125])
+    seeds.append([0, 150, 5, 10, 6, 6, 150, 150])
     best_params, best_value, chains_params, chains_values= mcmc.mcmc_minimize(
-        seeds, save_path=PATH, steps=10, n_walkers=n_walkers+1, tuning_steps=TUNING_STEPS, proposal_std=0.1
+        seeds, save_path=PATH, steps=1200, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
     )
 
     print(best_params, best_value)
