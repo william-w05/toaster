@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")           # safe on headless machines; remove for interactive
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle as MplRect
+from matplotlib.patches import Circle as MplCircle, Rectangle as MplRect, Wedge as MplWedge
 
 from . import fem_solve as cv
 
@@ -57,8 +57,13 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
     if created:
         fig, ax = plt.subplots(figsize=(9, 6))
  
-    if hasattr(spec, "radius"):                     # CylSpec
-        from matplotlib.patches import Circle as MplCircle
+    if isinstance(spec, cv.HalfPipeSpec):
+        cx, cy = spec.center
+        ax.add_patch(MplWedge((cx * MM, cy * MM), spec.radius * MM,
+                              theta1=0.0, theta2=180.0,
+                              facecolor="#eaf3fb", edgecolor="#1f4e79",
+                              lw=2.0, zorder=0))
+    elif isinstance(spec, cv.CylSpec):
         cx, cy = spec.center
         ax.add_patch(MplCircle((cx * MM, cy * MM), spec.radius * MM,
                                facecolor="#eaf3fb", edgecolor="#1f4e79",
@@ -521,5 +526,16 @@ def cyl_spec(radius, tag="cyl", mesh_size=0.001, wall_material=None):
     if wall_material is not None:
         kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
     return cv.CylSpec(
+        center=(0.0, 0.0), radius=radius, metal=[], mesh_size=mesh_size,
+        tag=tag, **kw)
+
+def half_pipe_spec(radius, tag="half pipe", mesh_size=0.001, wall_material=None):
+    """
+    Build a simple half-pipe cavity spec with no internal features.
+    """
+    kw = {}
+    if wall_material is not None:
+        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
+    return cv.HalfPipeSpec(
         center=(0.0, 0.0), radius=radius, metal=[], mesh_size=mesh_size,
         tag=tag, **kw)

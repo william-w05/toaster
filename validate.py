@@ -3,6 +3,7 @@ from scripts import fem_vis as viz
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy
+import time
 
 C = 3e8 # speed of light in m/s
 
@@ -47,6 +48,8 @@ def get_degeneracies_cyl(mn_list, modes_list, num_modes):
     return degeneracies[:num_modes], degen_modes[:num_modes]
 
 # test solver on rectangular configuration
+t0 = time.perf_counter()
+print('validating on rectangular configuration...')
 rect_spec = viz.rect_spec(width=0.25, height=0.5, mesh_size=0.005) # dimensions in meters
 viz.plot_spec(rect_spec, title="Rectangular Specimen", save="test_results/test_rect_spec.png")
 viz.plot_mesh(rect_spec, title="Rectangular Specimen Mesh", save="test_results/test_rect_mesh.png")
@@ -73,6 +76,9 @@ ax[1,1].contourf(X, Y, np.sin(lowest_mn[4][0] * np.pi * (X-0.125) / 0.25) * np.s
 ax[1,2].contourf(X, Y, np.sin(lowest_mn[5][0] * np.pi * (X-0.125) / 0.25) * np.sin(lowest_mn[5][1] * np.pi * (Y-0.25) / 0.5), cmap="RdBu_r", levels=30) # TM_13
 plt.tight_layout()
 plt.savefig("test_results/test_rect_modes_ground_truth.png", dpi=140); plt.close(fig)
+
+print(f'finished validation on rectangular config in {time.perf_counter()-t0} seconds')
+print('starting validation on cylindrical config...')
 
 # test solver on cylindrical configuration
 cyl_spec = viz.cyl_spec(radius=0.125, mesh_size=0.0025) # dimensions in meters
@@ -110,3 +116,18 @@ for i in range(12):
 
 plt.tight_layout()
 plt.savefig("test_results/test_cyl_modes_ground_truth.png", dpi=140); plt.close(fig1)
+
+print(f'finished validation on cylindrical config in {time.perf_counter()-t0} seconds')
+print('starting validation on half-pipe config...')
+
+# validate against metallic half-pipe
+
+half_pipe_spec = viz.half_pipe_spec(0.1)
+viz.plot_spec(half_pipe_spec, title="Half-pipe Specimen", save="test_results/test_half_spec.png")
+viz.plot_mesh(half_pipe_spec, title="Half-pipe Specimen Mesh", save="test_results/test_half_mesh.png")
+
+out_half = fem.solve_cavity(half_pipe_spec, keep_fields=True)
+#print('freqs:', np.array(out_half['freqs']))
+#print('modes:', np.array(out_half['modes']))
+print(f'finished validation on half-pipe config in {time.perf_counter()-t0} seconds.')
+viz.plot_modes(half_pipe_spec, out_half, save="test_results/test_half_modes.png")

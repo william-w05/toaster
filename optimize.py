@@ -39,16 +39,15 @@ if __name__ == "__main__":
     #rounded_params = np.array([0, 128.69, 4.6586, 10, 6.9514, 6.734, 124.87, 123.77])
     
     n_walkers = 8
-    seeds = generate_seeds(n_walkers)
-    seeds.append([0, 125, 5, 10, 6, 6, 125, 125])
-    seeds.append([0, 150, 5, 10, 6, 6, 150, 150])
-    print(seeds)
-    best_params, best_value, chains_params, chains_values=mcmc.mcmc_minimize(
-        seeds, save_path=PATH, steps=1200, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
-    )
+    #seeds = generate_seeds(n_walkers)
+    #seeds.append([0, 125, 5, 10, 6, 6, 125, 125])
+    #seeds.append([0, 150, 5, 10, 6, 6, 150, 150])
+    #print(seeds)
+    #best_params, best_value, chains_params, chains_values=mcmc.mcmc_minimize(
+    #    seeds, save_path=PATH, steps=1200, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1)
 
-    #best_params, best_value, chains_params, chains_values = mcmc.continue_mcmc(
-    #    steps=958, save_path=PATH, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
-    #)
+    best_params, best_value, chains_params, chains_values = mcmc.continue_mcmc(
+        steps=892, save_path=PATH, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
+    )
 
     #print(best_params, best_value)

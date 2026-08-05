@@ -256,6 +256,82 @@ class CylSpec:
         R = self.radius
         return (cx - R, cy - R, cx + R, cy + R)
 
+@dataclass
+class HalfPipeSpec:
+    """
+    Half-disk cross-section (an infinite half-cylinder in 2D): the disk of `radius`
+    about `center`, cut along the diameter y = cy. Interface-compatible with
+    CavitySpec, so solve_cavity / run_batch / plot_mesh take it unchanged.
+ 
+    upper : True keeps y >= cy, False keeps y <= cy (a trough). The flat face is a
+        conducting wall either way, so it joins the "wall" boundary group.
+ 
+    Also a clean validation case: with PEC on both the arc and the diameter the
+    modes are exactly the sin(m theta) branch of the full disk,
+ 
+        f_mn = c * j_{m,n} / (2 pi R),   m >= 1, and NON-degenerate
+ 
+    -- the cos branch is killed by E_z = 0 on the diameter, which is why CylSpec's
+    doublets collapse to single modes here. See halfpipe_analytic().
+ 
+    radius : metres.
+    metal / dielectric : optional Rect inclusions, exactly as in CavitySpec.
+    """
+    radius: float
+    center: tuple = (0.0, 0.0)
+    upper: bool = True
+    metal: list = field(default_factory=list)
+    dielectric: list = field(default_factory=list)
+    background: Material = field(default_factory=lambda: Material("vacuum"))
+    wall_material: Material = field(default_factory=lambda: Material("cu"))
+    metal_material: Material = field(default_factory=lambda: Material("cu"))
+    mesh_size: float = 0.004
+    mesh_size_min: float | None = None
+    mesh_uniform: bool = False
+    tag: str = ""
+ 
+    def add_outer(self, occ):
+        """
+        Must return a SURFACE tag -- build_mesh does dom = [(2, outer)].
+ 
+        Build the disk, then cut away the unwanted half with an oversized
+        rectangle. The cutter extends 1.5R past the disk in x so the shapes
+        properly overlap rather than meeting tangentially at a corner, and tags are
+        left for gmsh to assign rather than hardcoded (hardcoded tags collide with
+        the metal rectangles added afterwards).
+        """
+        cx, cy = self.center
+        R = self.radius
+        disk = occ.addDisk(cx, cy, 0.0, R, R)
+        y0 = (cy - 1.5 * R) if self.upper else cy      # the half to REMOVE
+        cutter = occ.addRectangle(cx - 1.5 * R, y0, 0.0, 3.0 * R, 1.5 * R)
+        out, _ = occ.cut([(2, disk)], [(2, cutter)],
+                         removeObject=True, removeTool=True)
+        surfs = [t for (d, t) in out if d == 2]
+        if len(surfs) != 1:
+            raise ValueError(f"half-pipe cut produced {len(surfs)} surfaces, "
+                             f"expected 1 (radius={R}, center={self.center})")
+        return surfs[0]
+ 
+    def on_wall(self, pts):
+        """The boundary is the arc PLUS the flat diameter; both are conducting."""
+        cx, cy = self.center
+        x, y = pts[:, 0], pts[:, 1]
+        r = np.hypot(x - cx, y - cy)
+        tol = _BBOX_TOL + 1e-6 * self.radius
+        on_arc = np.all(np.abs(r - self.radius) < tol)
+        # flat face: on the line y = cy AND inside the disk, so an interior metal
+        # edge that happens to sit at y = cy is not swept up as outer wall
+        on_flat = (np.all(np.abs(y - cy) < tol) and
+                   np.all(r <= self.radius + tol))
+        return bool(on_arc or on_flat)
+ 
+    @property
+    def extent(self):
+        cx, cy = self.center
+        R = self.radius
+        return ((cx - R, cy, cx + R, cy + R) if self.upper
+                else (cx - R, cy - R, cx + R, cy))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # geometry + mesh
