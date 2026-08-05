@@ -22,14 +22,18 @@ $$\mathbf{E}_\perp=\frac{ik}{\gamma^2}\nabla_\perp\psi$$
 
 where $\psi=E_z$ and $\gamma^2=\mu\varepsilon\frac{\omega^2}{c^2}-k^2.$ Thus, this reduces the 3D wave equation to an appropriate scalar problem, since $\psi$ satisfies the equation
 
-$$(\nabla_\perp^2+\gamma^2)\psi=0.$$
+$$(\nabla_\perp^2+\gamma^2)\psi=0$$
 
-We use the form 
+subject to $\psi|_{\partial\Omega}=0.$ We can rewrite this as follows: first, fix $\mathbf{E}=\mathbf{E}_\perp+\mathbf{E}_z=\mathbf{E}_\perp+\psi\hat{z}$. Then $-k^2\psi=\frac{\partial^2\psi}{\partial z^2}$, so we have
 
-$$-\nabla\cdot\left(\frac1{\mu}\nabla\psi\right)=\frac{\omega^2}{c^2}\varepsilon\psi$$
+$$\left(\nabla^2+\mu\varepsilon\frac{\omega^2}{c^2}\right)\psi=0$$
 
-and setting a test function $v$ gives
+or
 
-$$ \frac1{\mu}\int_\Omega\nabla\psi\cdot\nabla v=\frac{\varepsilon\omega^2}{c^2}\int_\Omega\psi v $$
+$$\frac1\mu\nabla\cdot(\nabla\psi)=\frac{\omega^2}{c^2}\varepsilon\psi.$$
 
-which is the weak formulation solved by the eigenvalue solver `scipy.sparse.linalg.eigsh`.
+Multiplying by a test function $v\in H_0^1(\Omega)$ and integrating, we get the weak formulation
+
+$$\frac1\mu\int_\Omega\nabla\psi\cdot\nabla v\mathrm dx=\varepsilon\frac{\omega^2}{c^2}\int_\Omega \psi v\mathrm dx$$
+
+which is the form solved by `scipy.sparse.linalg.eigsh`.
