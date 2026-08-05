@@ -1,5 +1,5 @@
-import fem_solve as fem
-import fem_vis as viz
+from scripts import fem_solve as fem
+from scripts import fem_vis as viz
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy
@@ -82,6 +82,7 @@ viz.plot_mesh(cyl_spec, title="Cylindrical Specimen Mesh", save="test_results/te
 out_cyl = fem.solve_cavity(cyl_spec, n_modes=12, keep_fields=True)
 viz.plot_modes(cyl_spec, out_cyl, save="test_results/test_cyl_modes.png")
 
+# ground truth for cylindrical configuration
 r_max = 0.125
 
 theta = np.linspace(0, 2 * np.pi, 100)
@@ -105,6 +106,7 @@ for i in range(12):
     axes_flat[i].contourf(THETA, R, Z, cmap="RdBu_r", levels=30)
     axes_flat[i].set_xticklabels([]) 
     axes_flat[i].set_yticklabels([])
+    axes_flat[i].set_title(f"TM_{degeneracies[i][0]}{degeneracies[i][1]}", fontsize=10)
 
 plt.tight_layout()
 plt.savefig("test_results/test_cyl_modes_ground_truth.png", dpi=140); plt.close(fig1)

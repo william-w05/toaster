@@ -14,11 +14,16 @@ import csv
 import time
 
 import numpy as np
+import scipy
 import torch
 from tqdm import tqdm
 
-import fem_solve as fem
-import fem_vis as viz
+from . import fem_solve as fem
+from . import fem_vis as viz
+
+import re as _re
+
+_NUM = _re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 # ── geometry constants, MILLIMETRES ─────────────────────────────────────────
 GAP0          = 10.0     # fixed gap flanking the centre toast
@@ -109,7 +114,7 @@ def _safe_log(p):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_spec(params_mm, toast_dx=0.0, toast_dy=0.0, mesh_size=MESH_SIZE,
-              tag="toaster"):
+              tag="toaster", mesh_uniform=False):
     """
     CavitySpec at one tuning position. toast_dx/dy are in METRES and move ALL
     THREE TOASTS (the dividers stay fixed).
@@ -121,8 +126,8 @@ def make_spec(params_mm, toast_dx=0.0, toast_dy=0.0, mesh_size=MESH_SIZE,
         mesh_size=mesh_size, tag=tag,
         wall_material=ALUMINIUM,
         metal_material=ALUMINIUM,
+        mesh_uniform=mesh_uniform
     )
-
 
 def tuning_positions(params_mm, n=16):
     """
@@ -135,7 +140,7 @@ def tuning_positions(params_mm, n=16):
         yield float(x), float(abs(x) * t), 3e8 / (2.0 * (GAP0_M + abs(x)))
 
 
-def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False):
+def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False, plot_all=False, mesh_uniform=False):
     """
     Solve the full tuning sweep in parallel and return the operating mode at each
     position.
@@ -147,12 +152,12 @@ def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False):
     positions = list(tuning_positions(params_mm, n=tuning_steps))
     specs, results = fem.run_sweep(
         lambda dx, dy, i: make_spec(params_mm, toast_dx=dx, toast_dy=dy,
-                                    tag=f"x={dx*1e3:.2f}mm"),
+                                    tag=f"x={dx*1e3:.2f}mm", mesh_uniform=False),
         positions,
         n_modes=N_MODES,
         n_workers=SWEEP_WORKERS,
         timeout=STEP_TIMEOUT,
-        keep_fields=False,          # fields are only needed for plotting
+        plot_all=plot_all,          # fields are only needed for plotting
         verbose=False,
     )
 
@@ -572,3 +577,219 @@ def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
                        best_path, evals_path, evals_width, save_interval,
                        n_candidates, log_each_solve, stuck_warn_every, stats,
                        desc="MCMC", seed_chain_csv=True)
+
+def NM_opt(x0, max_iters): 
+    res = scipy.optimize.minimize(fom, x0, method="Nelder-Mead", 
+                                  options={"disp": True, "maxiter": max_iters})
+    return res.x
+ 
+def _fmt_arr(p):
+    """
+    One-line array repr for the CSVs. np.array2string wraps at 75 characters by
+    default, which puts newlines INSIDE a csv field -- legal, but awkward to read
+    and to grep. The parser below copes with either form, so old files still load.
+    """
+    return np.array2string(np.asarray(p, dtype=np.float64), precision=8,
+                           separator=",", max_line_width=10**6)
+ 
+ 
+def _parse_params(cell, n_params=8):
+    nums = _NUM.findall(str(cell))
+    if len(nums) < n_params:
+        return None
+    return np.array([float(x) for x in nums[:n_params]], dtype=np.float64)
+ 
+ 
+def _parse_value(cell):
+    try:
+        return float(cell)
+    except (TypeError, ValueError):
+        m = _NUM.findall(str(cell))
+        return float(m[0]) if m else np.nan
+ 
+ 
+def _read_rows(path, n_params=8):
+    """Read a Walker|Parameters|Value CSV -> list of (walker, params, value)."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        has_walker = bool(header) and header[0].strip().lower() == "walker"
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+            if has_walker:
+                if len(row) < 3:
+                    continue
+                try:
+                    wid = int(float(row[0]))
+                except (TypeError, ValueError):
+                    continue
+                p, v = _parse_params(row[1], n_params), _parse_value(row[2])
+            else:
+                wid = 0
+                p, v = _parse_params(row[0], n_params), _parse_value(row[1])
+            if p is None:
+                continue
+            rows.append((wid, p, v))
+    return rows
+ 
+ 
+def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
+                    init_jitter=0.05):
+    """
+    Rebuild everything needed to resume, from the CSVs written by mcmc_minimize.
+ 
+    Walker positions come from all_params_all_values.csv, which is the CHAIN
+    (one row per walker per step, repeats included when a proposal is rejected).
+    fem_evals.csv is NOT used for this: its last row is the last PROPOSAL, which
+    is usually not the accepted state. The evals file is only a fallback if the
+    chain file is missing, and a count of prior evaluations for the diagnostics.
+ 
+    Returns dict: walkers [{params, value}], best_params, best_value,
+    n_steps_done, n_prior_evals.
+    """
+    all_path   = os.path.join(save_path, "all_params_all_values.csv")
+    best_path  = os.path.join(save_path, "best_params_best_values.csv")
+    evals_path = os.path.join(save_path, "fem_evals.csv")
+ 
+    chain = _read_rows(all_path, n_params)
+    source = "all_params_all_values.csv (chain states)"
+    if not chain:
+        chain = _read_rows(evals_path, n_params)
+        source = "fem_evals.csv (FALLBACK: proposals, not chain states)"
+    if not chain:
+        raise FileNotFoundError(
+            f"no resumable rows in {all_path} or {evals_path}. Run mcmc_minimize "
+            f"first, or check save_path.")
+ 
+    # last state and row count per walker id present in the file
+    last_state, per_walker = {}, {}
+    for wid, p, v in chain:
+        last_state[wid] = (p, v)
+        per_walker[wid] = per_walker.get(wid, 0) + 1
+    # the chain file is seeded with one row per walker before stepping, so the
+    # number of completed steps is (rows - 1)
+    n_steps_done = max(0, max(per_walker.values()) - 1)
+ 
+    # global best
+    best_params = best_value = None
+    best_rows = _read_rows(best_path, n_params)
+    if best_rows:
+        _, best_params, best_value = best_rows[0]
+    if best_params is None:
+        pool = [(p, v) for _w, p, v in chain if np.isfinite(v) and v > 0]
+        if not pool:
+            pool = [(p, v) for _w, p, v in chain]
+        best_params, best_value = min(pool, key=lambda pv: pv[1])
+ 
+    walkers = []
+    for w in range(n_walkers):
+        if w in last_state:
+            p, v = last_state[w]
+            walkers.append({"params": np.asarray(p, dtype=np.float64),
+                            "value": float(v)})
+        else:
+            walkers.append({"params": _jitter_within_limits(
+                np.asarray(best_params, dtype=np.float64), init_jitter),
+                "value": None})          # unknown -> evaluated by continue_mcmc
+ 
+    extra = sorted(set(last_state) - set(range(n_walkers)))
+    if extra:
+        print(f"[resume] NOTE: the file also contains walkers {extra}; they are "
+              f"ignored because n_walkers={n_walkers}.", flush=True)
+ 
+    n_prior_evals = len(_read_rows(evals_path, n_params))
+    return {"walkers": walkers,
+            "best_params": np.asarray(best_params, dtype=np.float64),
+            "best_value": float(best_value),
+            "n_steps_done": int(n_steps_done),
+            "n_prior_evals": int(n_prior_evals),
+            "source": source}
+ 
+ 
+def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
+                  save_interval=10, n_candidates=64, log_each_solve=True,
+                  stuck_warn_every=25, start_from="last", start_temp=None,
+                  n_walkers=1, init_jitter=0.05, n_params=8):
+    """
+    Resume a run from its CSVs.
+ 
+    start_from : "last" -> every walker resumes from its own last chain state
+                 "best" -> walker 0 restarts at the global best, the rest at
+                           log-jittered copies of it
+    start_temp : override the annealing temperature. Otherwise it is rebuilt from
+                 the schedule, TEMP0 * COOLING**n_steps_done (floored at TEMP_MIN),
+                 which is exact here because the cooling is geometric -- if you
+                 ever switch to an adaptive schedule this must be persisted to a
+                 file instead, since it stops being a closed form of the step index.
+ 
+    Walkers with no stored state (e.g. resuming a 1-walker run with n_walkers=4)
+    each cost one fresh FOM evaluation before stepping.
+ 
+    Returns (best_params, best_value, chains_params, chains_values), as
+    mcmc_minimize does.
+    """
+    state = load_mcmc_state(save_path, n_params, n_walkers, init_jitter)
+    print(f"[resume] source        : {state['source']}", flush=True)
+    print(f"[resume] prior steps   : {state['n_steps_done']}  "
+          f"({state['n_prior_evals']} prior evaluations)", flush=True)
+    print(f"[resume] best so far   : {state['best_value']:.6g}", flush=True)
+    print(f"[resume] best params   : {_fmt_params(state['best_params'])}", flush=True)
+ 
+    stats = {"proposals": 0, "accepted": 0, "improved": 0, "skipped_noop": 0,
+             "rejected_limits": 0, "rejected_form_factor": 0, "failed_eval": 0,
+             "failed_steps": 0, "evaluations": state["n_prior_evals"]}
+ 
+    all_path, best_path, evals_path, evals_width = _ensure_csvs(save_path)
+ 
+    if start_from == "best":
+        walker_params = [state["best_params"].copy()]
+        walker_values = [state["best_value"]]
+        for _ in range(1, n_walkers):
+            walker_params.append(_jitter_within_limits(state["best_params"],
+                                                       init_jitter))
+            walker_values.append(None)
+    elif start_from == "last":
+        walker_params = [wk["params"].copy() for wk in state["walkers"]]
+        walker_values = [wk["value"] for wk in state["walkers"]]
+    else:
+        raise ValueError("start_from must be 'last' or 'best'")
+ 
+    best_params = state["best_params"].copy()
+    best_value = state["best_value"]
+ 
+    n_p = walker_params[0].size
+    proposal_std = (np.asarray(proposal_std, dtype=np.float64)
+                    if np.ndim(proposal_std) > 0
+                    else np.full(n_p, float(proposal_std)))
+ 
+    # temperature
+    if start_temp is not None:
+        temp, src = float(start_temp), "start_temp argument"
+    else:
+        temp = max(TEMP_MIN, TEMP0 * (COOLING ** state["n_steps_done"]))
+        src = f"schedule TEMP0*{COOLING}^{state['n_steps_done']}"
+    print(f"[resume] starting temp : {temp:.6g}  ({src})", flush=True)
+ 
+    # evaluate any walker whose value is unknown (freshly seeded)
+    for w in range(n_walkers):
+        if walker_values[w] is None:
+            v, det, el = _evaluate(w, walker_params[w], tuning_steps, stats,
+                                   log_each_solve, temp, tag="seed")
+            _log_eval(evals_path, evals_width, w, walker_params[w], v, el, det, temp)
+            walker_values[w] = v
+            if float(v) < float(best_value):
+                best_params, best_value = walker_params[w].copy(), v
+ 
+    return _run_chains(walker_params, walker_values, best_params, best_value,
+                       temp, steps, proposal_std, tuning_steps, all_path,
+                       best_path, evals_path, evals_width, save_interval,
+                       n_candidates, log_each_solve, stuck_warn_every, stats,
+                       desc="MCMC(resume)",
+                       # the resumed states are already the last rows of the chain
+                       # file; re-seeding would duplicate them and inflate the step
+                       # count on the NEXT resume
+                       seed_chain_csv=False)

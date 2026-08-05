@@ -61,6 +61,7 @@ from skfem import (Basis, FacetBasis, ElementTriP1, ElementTriP2,
                    BilinearForm, Functional, asm)
 from skfem.helpers import dot, grad
 from scipy.sparse.linalg import eigsh
+import matplotlib.pyplot as plt
 
 # physical constants (SI)
 C0   = 299792458.0
@@ -193,6 +194,7 @@ class CavitySpec:
     metal_material: Material = field(default_factory=lambda: Material("cu"))
     mesh_size: float = 0.004
     mesh_size_min: float | None = None
+    mesh_uniform: bool = False   # see build_mesh: pin every element to mesh_size
     tag: str = ""            # free-form label carried through to the results
 
     # ---- outer-shape hooks: everything else in build_mesh is shape-agnostic --
@@ -235,6 +237,7 @@ class CylSpec:
     metal_material: Material = field(default_factory=lambda: Material("cu"))
     mesh_size: float = 0.004
     mesh_size_min: float | None = None
+    mesh_uniform: bool = False
     tag: str = ""
 
     def add_outer(self, occ):
@@ -381,9 +384,29 @@ def build_mesh(spec, msh_path: str, verbose: bool = False):
             g = gmsh.model.addPhysicalGroup(1, metal); gmsh.model.setPhysicalName(1, g, "metal")
 
         # ---- mesh ------------------------------------------------------------
-        hmin = spec.mesh_size_min if spec.mesh_size_min else spec.mesh_size / 3.0
-        gmsh.option.setNumber("Mesh.MeshSizeMax", spec.mesh_size)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", hmin)
+        # Two regimes:
+        #
+        #  mesh_uniform=False (default): elements may shrink to mesh_size_min
+        #    (default mesh_size/3) near small geometric features. gmsh does this
+        #    through MeshSizeExtendFromBoundary and MeshSizeFromPoints, both on by
+        #    default. Better accuracy per element, but the element size is not a
+        #    single number, so it is NOT directly comparable with another code.
+        #
+        #  mesh_uniform=True: pin min = max = mesh_size and switch off the
+        #    feature-driven refinement, giving a near-uniform mesh. This is the
+        #    setting to use when matching COMSOL with min element size = max
+        #    element size, where COMSOL's growth rate / curvature factor /
+        #    narrow-region resolution are all inoperative because the size is
+        #    clamped from both sides.
+        if spec.mesh_uniform:
+            gmsh.option.setNumber("Mesh.MeshSizeMax", spec.mesh_size)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", spec.mesh_size)
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+        else:
+            hmin = spec.mesh_size_min if spec.mesh_size_min else spec.mesh_size / 3.0
+            gmsh.option.setNumber("Mesh.MeshSizeMax", spec.mesh_size)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", hmin)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
         gmsh.option.setNumber("Mesh.Algorithm", 6)          # frontal-Delaunay
         gmsh.model.mesh.generate(2)
@@ -634,10 +657,46 @@ def run_batch(specs, n_modes: int = 6, f_target=None,
                       flush=True)
     return results
 
+def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
+    """
+    Duplicate of plot_modes_square magnitude in fem_vis to avoid circular import.
+    """
+    MM = 1000.0
+    if "fields" not in result:
+        raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
+    m = result["mesh"]
+    nmodes = len(result["fields"]) if n is None else min(n, len(result["fields"]))
+    ncol = min(3, nmodes); nrow = int(np.ceil(nmodes / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 3.4 * nrow),
+                                squeeze=False)
+    nv = m.p.shape[1]
+    for i in range(nmodes):
+        ax = axes[i // ncol][i % ncol]
+        u = result["fields"][i][:nv]          # P2: vertex dofs come first
+        val = np.abs(u) ** 2
+        #lim = np.max(val) or 1.0
+        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
+                            cmap=cmap, shading="gouraud")
+        for nm, col in (("wall", "#111111"), ("metal", "#111111")):
+            if nm in m.boundaries:
+                f = m.facets[:, m.boundaries[nm]]
+                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
+        md = result["modes"][i]
+        ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
+                        f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(tp, ax=ax, fraction=0.035)
+    for j in range(nmodes, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle(f"E_z modes: {spec.tag or ''}", y=1.0)
+    if save:
+        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
+    return fig
+
 
 def run_sweep(spec_fn, positions, n_modes: int = 6, order: int = 2,
               n_workers: int | None = None, timeout: float | None = None,
-              keep_fields: bool = False, verbose: bool = True):
+              verbose: bool = True, plot_all: bool = False):
     """
     Parallel tuning sweep -- the usual reason a run feels slow is that the steps
     are done one at a time on one core while the rest of the machine sits idle.
@@ -652,7 +711,13 @@ def run_sweep(spec_fn, positions, n_modes: int = 6, order: int = 2,
     pos = list(positions)
     specs = [spec_fn(dx, dy, i) for i, (dx, dy, _f) in enumerate(pos)]
     guesses = [f for _dx, _dy, f in pos]
+
     results = run_batch(specs, n_modes=n_modes, f_target=guesses, order=order,
                         n_workers=n_workers, timeout=timeout, verbose=verbose,
-                        keep_fields=keep_fields)
+                        keep_fields=plot_all)
+
+    if plot_all:
+        for i, spec in enumerate(specs):
+            plot_modes_square_magnitude(spec, results[i], save=f"TEMP/TEMP_tuning_{i+1}_pos_mode.png")
+    
     return specs, results
