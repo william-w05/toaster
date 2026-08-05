@@ -25,10 +25,11 @@ where $\psi=E_z$ and $\gamma^2=\mu\varepsilon\frac{\omega^2}{c^2}-k^2.$ Thus, th
 $$(\nabla_\perp^2+\gamma^2)\psi=0.$$
 
 We use the form 
+
 $$-\nabla\cdot\left(\frac1{\mu}\nabla\psi\right)=\frac{\omega^2}{c^2}\varepsilon\psi$$
 
 and setting a test function $v$ gives
 
-$$ \frac1{\mu}\int_\Omega\nabla\psi\cdot\nabla v=\frac{\omega^2}{c^2}\int_\Omega\varepsilon\psi v $$
+$$ \frac1{\mu}\int_\Omega\nabla\psi\cdot\nabla v=\frac{\varepsilon\omega^2}{c^2}\int_\Omega\psi v $$
 
 which is the weak formulation solved by the eigenvalue solver `scipy.sparse.linalg.eigsh`.
