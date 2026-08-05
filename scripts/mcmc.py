@@ -259,6 +259,8 @@ def proposed_params_within_limits(proposal):
     # CENTRE TOAST WIDTH
     if proposal[4] < 3:
         okay = False
+    elif proposal[4] > 20:
+        okay = False # reject center widths that are too wide
 
     # SIDE TOAST HEIGHT / WIDTH: within 20% of the centre toast
     if proposal[7] <= 0.8 * proposal[6] or proposal[7] >= 1.2 * proposal[6]:
