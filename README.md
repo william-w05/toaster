@@ -24,7 +24,14 @@ where $\psi=E_z$ and $\gamma^2=\mu\varepsilon\frac{\omega^2}{c^2}-k^2.$ Thus, th
 
 $$(\nabla_\perp^2+\gamma^2)\psi=0$$
 
-subject to $\psi|_{\partial\Omega}=0.$ We can rewrite this as follows: first, fix $\mathbf{E}=\mathbf{E}_\perp+\mathbf{E}_z=\mathbf{E}_\perp+\psi\hat{z}$. Then $-k^2\psi=\frac{\partial^2\psi}{\partial z^2}$, so we have
+subject to 
+$$\psi|_{\partial\Omega}=0.$$
+
+We can rewrite this as follows: first, fix 
+ 
+$$\mathbf{E}=\mathbf{E}_\perp+\mathbf{E}_z=\mathbf{E}_\perp+\psi\hat{z}$. Then $-k^2\psi=\frac{\partial^2\psi}{\partial z^2}$$
+ 
+so we have
 
 $$\left(\nabla^2+\mu\varepsilon\frac{\omega^2}{c^2}\right)\psi=0$$
 
