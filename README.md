@@ -37,7 +37,7 @@ $$\left(\nabla^2+\mu\varepsilon\frac{\omega^2}{c^2}\right)\psi=0$$
 
 or
 
-$$\frac1\mu\nabla\cdot(\nabla\psi)=\frac{\omega^2}{c^2}\varepsilon\psi.$$
+$$-\frac1\mu\nabla\cdot(\nabla\psi)=\frac{\omega^2}{c^2}\varepsilon\psi.$$
 
 Multiplying by a test function $v\in H_0^1(\Omega)$ and integrating, we get the weak formulation
 
