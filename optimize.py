@@ -47,7 +47,7 @@ if __name__ == "__main__":
     #    seeds, save_path=PATH, steps=1200, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1)
 
     best_params, best_value, chains_params, chains_values = mcmc.continue_mcmc(
-        steps=892, save_path=PATH, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
+        steps=862, save_path=PATH, n_walkers=n_walkers+2, tuning_steps=TUNING_STEPS, proposal_std=0.1
     )
 
     #print(best_params, best_value)

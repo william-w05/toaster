@@ -4,7 +4,7 @@ Custom-built FEM solver for cavity simulations, and MCMC + simulated annealing f
 
 # Scalar problem
 
-For propagation of EM waves in a hollow waveguide or cavity in the $z$-direction, it can be shown that (Eq. 8.24 in Jackson)
+For propagation of EM waves in a hollow waveguide or cavity in the $z$-direction with homogeneous media, it can be shown that (Eq. 8.24 in Jackson, 2nd ed.)
 
 $$\mathbf{B}_\perp=\frac{1}{\mu\varepsilon\frac{\omega^2}{c^2}-k^2}\left[\nabla_\perp\left(\frac{\partial B_z}{\partial z}\right)+i\mu\varepsilon\frac{\omega}{c}\hat{\mathbf{z}}\times\nabla_\perp E_z\right]$$
 
@@ -12,7 +12,7 @@ and
 
 $$\mathbf{E}_\perp=\frac1{\mu\varepsilon\frac{\omega^2}{c^2}-k^2}\left[\nabla_\perp\left(\frac{\partial E_z}{\partial z}\right)-i\frac{\omega}{c}\hat{\mathbf{z}}\times\nabla_\perp B_z\right]$$
 
-i.e. the transverse components of the electric and magnetic fields depend only on the $z$-components of the electric and magnetic fields. For TM waves, we also have the boundary conditions $E_z\equiv0$ on the surface and $B_z\equiv0$ everywhere. The above equations therefore reduce to
+i.e. the transverse components of the electric and magnetic fields depend only on the $z$-components of the electric and magnetic fields. For TM waves, we also have $B_z\equiv0$ everywhere, as well as the boundary condition $E_z\equiv0$ on the surface $S$. The above equations therefore reduce to
 
 $$\mathbf{B}_\perp=\frac{\mu\varepsilon\omega}{ck}\hat{\mathbf{z}}\times\mathbf{E}_\perp$$
 
@@ -25,22 +25,13 @@ where $\psi=E_z$ and $\gamma^2=\mu\varepsilon\frac{\omega^2}{c^2}-k^2.$ Thus, th
 $$(\nabla_\perp^2+\gamma^2)\psi=0$$
 
 subject to 
-$$\psi|_{\partial\Omega}=0.$$
+$$\psi|_{S}=0.$$
+We can rewrite this as follows: write $\psi(x,y,z)=u(x,y)e^{ikz}$, so that $\nabla_\perp^2\psi=\left(\nabla^2u\right)e^{ikz}$. Then
 
-We can rewrite this as follows: first, fix 
- 
-$$\mathbf{E}=\mathbf{E}_\perp+\mathbf{E}_z=\mathbf{E}_\perp+\psi\hat{z}.$$
+$$(\nabla^2+\gamma^2)u=0$$
 
-Then $-k^2\psi=\frac{\partial^2\psi}{\partial z^2}$, so we have
+after dividing by $e^{ikz}.$ If $\Omega$ now denotes the 2D domain of definition of $u$, then multiplying both sides of the above equation by $v\in H_0^1(\Omega)$ and integrating gives the weak formulation
 
-$$\left(\nabla^2+\mu\varepsilon\frac{\omega^2}{c^2}\right)\psi=0$$
+$$\int_\Omega\nabla u\cdot\nabla v\mathrm dx=\gamma^2\int_\Omega uv\mathrm dx.$$
 
-or
-
-$$-\frac1\mu\nabla\cdot(\nabla\psi)=\frac{\omega^2}{c^2}\varepsilon\psi.$$
-
-Multiplying by a test function $v\in H_0^1(\Omega)$ and integrating, we get the weak formulation
-
-$$\frac1\mu\int_\Omega\nabla\psi\cdot\nabla v\mathrm dx=\varepsilon\frac{\omega^2}{c^2}\int_\Omega \psi v\mathrm dx$$
-
-which is the form solved by `scipy.sparse.linalg.eigsh`.
+This is the form solved by `scipy.sparse.linalg.eigsh`. (Note that we set $k=0$ because we only care for the modes with no $z$-variation. It follows then that $\gamma^2=\mu\varepsilon\frac{\omega^2}{c^2}$ give the eigenfrequencies we are solving for.)

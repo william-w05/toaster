@@ -536,7 +536,7 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
 
 
 def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
-                  save_path="./csvs/", save_interval=10, n_candidates=64,
+                  save_path="./csvs/", save_interval=1, n_candidates=64,
                   log_each_solve=True, stuck_warn_every=25, n_walkers=1,
                   init_jitter=0.05):
     """
@@ -713,7 +713,7 @@ def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
  
  
 def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
-                  save_interval=10, n_candidates=64, log_each_solve=True,
+                  save_interval=1, n_candidates=64, log_each_solve=True,
                   stuck_warn_every=25, start_from="last", start_temp=None,
                   n_walkers=1, init_jitter=0.05, n_params=8):
     """
