@@ -26,7 +26,8 @@ $$(\nabla_\perp^2+\gamma^2)\psi=0$$
 
 subject to 
 $$\psi|_{S}=0.$$
-We can rewrite this as follows: write $\psi(x,y,z)=u(x,y)e^{ikz}$, so that $\nabla_\perp^2\psi=\left(\nabla^2u\right)e^{ikz}$. Then
+We can rewrite this as follows: write 
+$$\psi(x,y,z)=u(x,y)e^{ikz}$$, so that $\nabla_\perp^2\psi=\left(\nabla^2u\right)e^{ikz}$. Then
 
 $$(\nabla^2+\gamma^2)u=0$$
 
