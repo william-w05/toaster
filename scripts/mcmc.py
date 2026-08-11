@@ -3,44 +3,78 @@ Multi-walker simulated-annealing MCMC driving the FEM cavity solver.
 
 UNITS -- the one thing to keep straight
     The MCMC (parameters, proposals, constraints, CSVs) works entirely in
-    MILLIMETERS, matching proposed_params_within_limits (gap0=10, cy=160).
-    fem_solve works entirely in METRES. The conversion happens in exactly one
+    MILLIMETERS, matching proposed_params_within_limits (gap0 = gap1 = 10, cy = 160).
+    fem_solve works entirely in METERS. The conversion happens in exactly one
     place, _params_to_m(), at the boundary. Nothing else converts.
     params[0] is an ANGLE in degrees and is never scaled.
+
+PARAMETER VECTOR -- 7 entries (gap1 is fixed, no longer optimised)
+    0 angle | 1 div_h | 2 div_w | 3 ctr_w | 4 side_w | 5 ctr_h | 6 side_h
+    Index them through the I_* constants, never with literals: dropping gap1
+    shifted every index above 2, and a literal 6 that used to mean ctr_h now
+    means side_h. Legacy 8-vectors are accepted anywhere and the gap1 entry
+    stripped, so old CSVs and starting points still load.
+
+CSV ATOMICITY
+    Rows are committed one COMPLETE MCMC iteration at a time. Interrupting
+    mid-iteration (some walkers stepped, others not) discards that iteration
+    entirely rather than leaving a ragged partial group in fem_evals.csv.
 """
 
 import os
 import csv
 import time
+import re as _re
+from collections import deque
 
 import numpy as np
 import scipy
 import torch
+import torch.nn as nn
+import torch.optim as optim
 from tqdm import tqdm
 
 from . import fem_solve as fem
 from . import fem_vis as viz
 
-import re as _re
-
 _NUM = _re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
-# ── geometry constants, MILLIMETRES ─────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════════════
+# constants
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── geometry, MILLIMETERS ───────────────────────────────────────────────────
 GAP0          = 10.0     # fixed gap flanking the centre toast
+GAP1          = 10.0     # FIXED: no longer a free parameter
 CAVITY_HEIGHT = 160.0
 X_MAX_FREQ    = 8.75     # |x| that tunes 15 GHz -> 8 GHz
 F_MAX         = 3e11 / (2.0 * GAP0)          # 15 GHz at x=0 (c = 3e11 mm/s)
 
-MM = 1e-3                # millimetres -> metres
+MM = 1e-3                # millimeters -> meters
 GAP0_M   = GAP0 * MM
+GAP1_M   = GAP1 * MM
 CAV_H_M  = CAVITY_HEIGHT * MM
 X_MAX_M  = X_MAX_FREQ * MM
 
+# ── the parameter vector ────────────────────────────────────────────────────
+PARAM_NAMES = ["angle", "div_h", "div_w", "ctr_w", "side_w", "ctr_h", "side_h"]
+N_PARAMS    = 7
+I_ANGLE, I_DIVH, I_DIVW, I_CTRW, I_SIDEW, I_CTRH, I_SIDEH = range(N_PARAMS)
+
+# ── bounds (MILLIMETERS / degrees) ──────────────────────────────────────────
+ANGLE_MIN, ANGLE_MAX   = 0.0, 20.0     # was [0, 70]
+H_MIN, H_MAX           = 90.0, 145.0   # ALL heights: div_h, ctr_h, side_h
+H_TOL                  = 0.2           # div_h, side_h within +/-20% of ctr_h
+CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
+SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0     # side width capped at 20 mm
+SIDE_W_TOL             = 0.2           # side_w within +/-20% of ctr_w
+DIV_W_MIN              = 3.0           # div_w in [3, gap0)
+TOTAL_W_MAX            = 400.0 / np.sqrt(2.0)
+
 # ── solver settings ─────────────────────────────────────────────────────────
-MESH_SIZE   = 0.001     # METRES. Q converged to 0.6%, C to 2.7%; ~2.5x faster
-                         # than 0.001. Tighten when ranking geometries whose C
-                         # differs by only a few percent.
-N_MODES     = 6
+MESH_SIZE     = 0.001    # METERS
+N_MODES       = 6
 SWEEP_WORKERS = None     # None -> every core (the sweep is the parallel part)
 STEP_TIMEOUT  = 600      # s per tuning position
 
@@ -53,106 +87,123 @@ TEMP_MIN = 1e-3
 PENALTY  = 1e33
 C_FLOOR  = 0.05          # reject a geometry whose worst-step form factor is below this
 
-PARAM_NAMES = ["angle", "div_h", "div_w", "gap1",
-               "ctr_w", "side_w", "ctr_h", "side_h"]
+# ── surrogate defaults ──────────────────────────────────────────────────────
+# The schedule is counted in MCMC STEPS, not evaluations: one step is n_walkers
+# evaluations, so with n walkers the first fit sees ~100n evaluations and each
+# refit adds ~50n. Keying on steps keeps the cadence identical however many
+# walkers you run.
+SURROGATE_MIN_STEPS     = 100    # MCMC steps before the FIRST fit
+SURROGATE_RETRAIN_EVERY = 50     # refit every this many MCMC steps
+SURROGATE_EPOCHS        = 1000   # epochs per fit
+SURROGATE_PROGRESS_EVERY = 100   # print training RMSE every this many epochs
+SURROGATE_MIN_SAMPLES   = 20     # hard floor: never fit on fewer points than this
+SURROGATE_HIDDEN        = 128
+SURROGATE_LR            = 3e-4
+SURROGATE_BUFFER        = 20000
 
 _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-"""_DEVICE_BANNER_SHOWN = False
 
 
-def _print_device_banner() -> None:
-    global _DEVICE_BANNER_SHOWN
-    if _DEVICE_BANNER_SHOWN:
-        return
-
-    print(f"[MCMC] device: {_dev}")
-    if _dev.type == "cuda":
-        print(f"[MCMC] GPU: {torch.cuda.get_device_name(0)}")
-    _DEVICE_BANNER_SHOWN = True
-
-
-_print_device_banner()"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
 def _fmt_params(p) -> str:
-    return ", ".join(f"{n}={v:.4g}" for n, v in zip(PARAM_NAMES, p))
+    return ", ".join(f"{n}={v:.4g}" for n, v in zip(PARAM_NAMES, np.ravel(p)))
+
+
+def _fmt_arr(p):
+    """One-line array repr for the CSVs. np.array2string wraps at 75 characters
+    by default, which puts newlines INSIDE a csv field -- legal, but awkward to
+    read and grep. The parser copes with either form, so old files still load."""
+    return np.array2string(np.asarray(p, dtype=np.float64), precision=8,
+                           separator=",", max_line_width=10**6)
 
 
 def _to_obj(value) -> float:
-    """Physical objective -> log objective used by Metropolis."""
+    """Physical objective -> log objective used by Metropolis and the surrogate."""
     v = float(value)
     if (not np.isfinite(v)) or v <= 0.0:
         return float(np.log(PENALTY))
     return float(np.log(v))
 
 
-def _params_to_m(params_mm):
-    """
-    THE unit boundary: mm -> m for lengths, angle untouched.
-    Everything upstream of this is mm; everything downstream is metres.
-    """
+def _as_7(params_mm):
+    """Coerce a 7- or legacy 8-vector to the 7-vector, in MILLIMETERS."""
     p = np.asarray(params_mm, dtype=np.float64).ravel()
+    if p.size == 8:                       # legacy: strip the gap1 entry
+        p = np.delete(p, 3)
+    if p.size != N_PARAMS:
+        raise ValueError(f"expected {N_PARAMS} parameters, got {p.size}")
+    return p
+
+
+def _params_to_m(params_mm):
+    """THE unit boundary: mm -> m for lengths, angle untouched."""
+    p = _as_7(params_mm)
     return np.concatenate([[p[0]], p[1:] * MM])
 
 
 def _safe_log(p):
-    """log for the proposal transform. min_angle is 0, so params[0] can approach
+    """log for the proposal transform. ANGLE_MIN is 0, so params[0] can approach
     zero and log(0) = -inf would poison the whole proposal batch."""
     return np.log(np.maximum(np.asarray(p, dtype=np.float64), 1e-12))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # geometry / sweep
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def make_spec(params_mm, toast_dx=0.0, toast_dy=0.0, mesh_size=MESH_SIZE,
               tag="toaster", mesh_uniform=False):
     """
-    CavitySpec at one tuning position. toast_dx/dy are in METRES and move ALL
-    THREE TOASTS (the dividers stay fixed).
+    CavitySpec at one tuning position. toast_dx/dy are in METERS and move ALL
+    THREE TOASTS (the dividers stay fixed). gap1 is FIXED at GAP1_M and passed
+    explicitly, since it is no longer carried in the parameter vector.
     """
     return viz.toaster_spec(
         _params_to_m(params_mm),          # <- conversion happens here, once
-        gap0=GAP0_M, cavity_h=CAV_H_M,
+        gap0=GAP0_M, gap1=GAP1_M, cavity_h=CAV_H_M,
         toast_dx=toast_dx, toast_dy=toast_dy,
         mesh_size=mesh_size, tag=tag,
         wall_material=ALUMINIUM,
         metal_material=ALUMINIUM,
-        mesh_uniform=mesh_uniform
+        mesh_uniform=mesh_uniform,
     )
+
 
 def tuning_positions(params_mm, n=16):
     """
-    Yields (dx, dy, f_guess) with dx/dy in METRES and f_guess in Hz.
+    Yields (dx, dy, f_guess) with dx/dy in METERS and f_guess in Hz.
     |x| sweeps 0 -> X_MAX_M and y = |x|*tan(theta); the frequency depends only on
     |x|, so f = c / (2*(gap0 + |x|)) is the shift-invert target for that step.
     """
-    t = np.tan(np.radians(float(params_mm[0])))
+    p = _as_7(params_mm)
+    t = np.tan(np.radians(float(p[I_ANGLE])))
     for x in -np.linspace(0.0, X_MAX_M, n):
         yield float(x), float(abs(x) * t), 3e8 / (2.0 * (GAP0_M + abs(x)))
 
 
-def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False, plot_all=False, mesh_uniform=False):
+def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False,
+              plot_all=False, mesh_uniform=False):
     """
     Solve the full tuning sweep in parallel and return the operating mode at each
     position.
 
-    Returns dict with arrays C, Q, f, V (all length = number of SUCCESSFUL steps)
+    Returns dict with arrays C, Q, f, V (length = number of SUCCESSFUL steps)
     plus n_failed. V is the cavity cross-sectional area in m^2 (the 2D stand-in
     for mode volume, per unit length).
     """
     positions = list(tuning_positions(params_mm, n=tuning_steps))
     specs, results = fem.run_sweep(
         lambda dx, dy, i: make_spec(params_mm, toast_dx=dx, toast_dy=dy,
-                                    tag=f"x={dx*1e3:.2f}mm", mesh_uniform=False),
+                                    mesh_size=mesh_size,
+                                    tag=f"x={dx*1e3:.2f}mm",
+                                    mesh_uniform=mesh_uniform),
         positions,
         n_modes=N_MODES,
         n_workers=SWEEP_WORKERS,
@@ -183,14 +234,14 @@ def sim_sweep(params_mm, tuning_steps=16, mesh_size=MESH_SIZE, verbose=False, pl
             "n_steps": tuning_steps}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # figure of merit
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def fom(params_mm, tuning_steps=16, c_cutoff=True, mesh_size=MESH_SIZE,
         verbose=False, return_details=False):
     """
-    Scan time (lower is better):   T = integral f^2 / (V^2 C^2 Q) df
+    Scan time (lower is better):  T propto integral f^2 / (V^2 C^2 Q) df
 
     Trapezoid over the tuning band. NOTE abs(df): f DECREASES along the sweep
     (15 -> 8 GHz), so a raw f[1:]-f[:-1] is negative and the integral comes out
@@ -220,72 +271,77 @@ def fom(params_mm, tuning_steps=16, c_cutoff=True, mesh_size=MESH_SIZE,
     V_mid = 0.5 * (V[:-1] + V[1:])
     df    = np.abs(np.diff(f))                     # <- abs: see docstring
 
-    integrand = f_mid**2 / (V_mid**2 * C_mid**2 * Q_mid)
-    value = float(np.sum(integrand * df))
+    value = float(np.sum(f_mid**2 / (V_mid**2 * C_mid**2 * Q_mid) * df))
     if (not np.isfinite(value)) or value <= 0.0:
         value = PENALTY
     return (value, d) if return_details else value
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# constraints (MILLIMETRES)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# constraints (MILLIMETERS)
+# ═════════════════════════════════════════════════════════════════════════════
 
 def proposed_params_within_limits(proposal):
-    okay = True
-    gap0, cy = GAP0, CAVITY_HEIGHT
-    min_angle, max_angle = 0.0, 70.0
-    theta = proposal[0]
+    """
+    All lengths in MILLIMETERS, angle in degrees. Indices come from the I_*
+    constants, NOT literals -- dropping gap1 shifted every index above 2.
+    """
+    try:
+        p = _as_7(proposal)
+    except ValueError:
+        return False
 
-    # the tuning angle may legitimately be 0, so only params 1..7 must be > 0
-    if np.any(np.asarray(proposal)[1:] <= 0):
-        okay = False
-    elif np.any(np.asarray(proposal) >= 160):
-        okay = False
+    theta  = p[I_ANGLE]
+    div_h  = p[I_DIVH];  div_w  = p[I_DIVW]
+    ctr_w  = p[I_CTRW];  side_w = p[I_SIDEW]
+    ctr_h  = p[I_CTRH];  side_h = p[I_SIDEH]
 
-    if theta < min_angle or theta > max_angle:
-        okay = False
+    # the tuning angle may legitimately be 0; every length must be > 0
+    if np.any(p[1:] <= 0) or np.any(p >= 160):
+        return False
 
-    # SIDE GAPS: within 10% of the centre gap
-    if proposal[3] > 1.1 * gap0 or proposal[3] < 0.9 * gap0:
-        okay = False
+    # TUNING ANGLE
+    if theta < ANGLE_MIN or theta > ANGLE_MAX:
+        return False
 
-    # CENTRE TOAST HEIGHT: clears the wall at maximum displacement
-    if proposal[6] > cy - 2 * gap0 * np.abs(np.tan(np.radians(theta))):
-        okay = False
-    elif proposal[6] < 80:
-        okay = False
+    # ALL HEIGHTS in [H_MIN, H_MAX]
+    for h in (div_h, ctr_h, side_h):
+        if h < H_MIN or h > H_MAX:
+            return False
 
-    # CENTRE TOAST WIDTH
-    if proposal[4] < 3:
-        okay = False
-    elif proposal[4] > 20:
-        okay = False # reject center widths that are too wide
+    # CENTRE TOAST HEIGHT also clears the wall at maximum displacement.
+    # With theta <= 20 deg this cap is >= 160 - 20*tan(20) = 152.7 mm, so H_MAX
+    # (145) always binds first and this never actually rejects. Kept because it is
+    # the physical clearance condition and would bind again if ANGLE_MAX rose.
+    if ctr_h > CAVITY_HEIGHT - 2 * GAP0 * np.abs(np.tan(np.radians(theta))):
+        return False
 
-    # SIDE TOAST HEIGHT / WIDTH: within 20% of the centre toast
-    if proposal[7] <= 0.8 * proposal[6] or proposal[7] >= 1.2 * proposal[6]:
-        okay = False
-    if proposal[5] >= 1.2 * proposal[4] or proposal[5] < 0.8 * proposal[4] or proposal[5] < 3:
-        okay = False
+    # DIVIDER / SIDE HEIGHTS within +/-20% of the centre toast
+    if div_h <= (1 - H_TOL) * ctr_h or div_h >= (1 + H_TOL) * ctr_h:
+        return False
+    if side_h <= (1 - H_TOL) * ctr_h or side_h >= (1 + H_TOL) * ctr_h:
+        return False
 
-    # DIVIDER HEIGHT / WIDTH
-    if proposal[1] <= 0.8 * proposal[6] or proposal[1] >= 1.2 * proposal[6]:
-        okay = False
-    if proposal[2] >= gap0 or proposal[2] < 3:
-        okay = False
+    # WIDTHS
+    if ctr_w < CTR_W_MIN or ctr_w > CTR_W_MAX:
+        return False
+    if side_w < SIDE_W_MIN or side_w > SIDE_W_MAX:
+        return False
+    if side_w >= (1 + SIDE_W_TOL) * ctr_w or side_w < (1 - SIDE_W_TOL) * ctr_w:
+        return False
+    if div_w < DIV_W_MIN or div_w >= GAP0:
+        return False
 
-    # TOTAL WIDTH: centre + 2*gap0 + 2*div + 4*gap1 + 2*side  (the +20 is 2*gap0,
-    # which the original expression omitted)
-    if (4 * proposal[3] + 2 * proposal[5] + 2 * proposal[2] + proposal[4]
-            + 2 * gap0 >= 400 / np.sqrt(2)):
-        okay = False
+    # TOTAL WIDTH: ctr_w + 2*gap0 + 2*div_w + 4*gap1 + 2*side_w
+    if (ctr_w + 2 * GAP0 + 2 * div_w + 4 * GAP1 + 2 * side_w) >= TOTAL_W_MAX:
+        return False
 
-    return okay
+    return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # proposals / walker init
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0):
     """n heavy-tailed Student-t proposals in log-space."""
@@ -299,12 +355,13 @@ def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0):
 
 
 def _jitter_within_limits(base, init_jitter, max_tries=200):
+    base = _as_7(base)
     lp = _safe_log(base)
     for _ in range(max_tries):
-        trial = np.exp(lp + np.random.normal(0.0, init_jitter, size=np.shape(base)))
+        trial = np.exp(lp + np.random.normal(0.0, init_jitter, size=base.shape))
         if proposed_params_within_limits(trial):
             return trial
-    return np.asarray(base, dtype=np.float64).copy()
+    return base.copy()
 
 
 def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
@@ -313,9 +370,10 @@ def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
         if ip.shape[0] != n_walkers:
             raise ValueError(f"initial_params has {ip.shape[0]} rows but "
                              f"n_walkers={n_walkers}")
-        return [row.copy() for row in ip]
+        return [_as_7(row) for row in ip]
     if ip.ndim != 1:
         raise ValueError("initial_params must be shape (d,) or (n_walkers, d)")
+    ip = _as_7(ip)
     if not proposed_params_within_limits(ip):
         print("[MCMC] WARNING: initial_params violates the limits.", flush=True)
     walkers = [ip.copy()]
@@ -325,9 +383,9 @@ def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
     return walkers
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSVs
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# CSVs  -- rows are built in memory and committed one COMPLETE iteration at a time
+# ═════════════════════════════════════════════════════════════════════════════
 
 # AcceptProb is the Metropolis acceptance probability for this proposal; Accepted
 # is the outcome of the coin flip. Both are blank for the baseline evaluations,
@@ -336,13 +394,20 @@ _EVALS_HEADER = ["Walker", "Parameters", "Value", "Time", "MinC", "MeanQ",
                  "FreqLo", "FreqHi", "Temp", "AcceptProb", "Accepted"]
 
 
+_RMSE_HEADER = ["Iteration", "NEvals", "NTest", "RMSE"]
+
+
 def _ensure_csvs(save_path):
     """Also reports the evals row width, so an existing CSV written by an older
     version keeps its own column count instead of being silently misaligned."""
     all_path   = os.path.join(save_path, "all_params_all_values.csv")
     best_path  = os.path.join(save_path, "best_params_best_values.csv")
     evals_path = os.path.join(save_path, "fem_evals.csv")
+    rmse_path  = os.path.join(save_path, "surrogate_rmse.csv")
     os.makedirs(save_path, exist_ok=True)
+    if not os.path.exists(rmse_path):
+        with open(rmse_path, "w", newline="") as fh:
+            csv.writer(fh).writerow(_RMSE_HEADER)
     if not os.path.exists(all_path):
         with open(all_path, "w", newline="") as fh:
             csv.writer(fh).writerow(["Walker", "Parameters", "Value"])
@@ -356,33 +421,230 @@ def _ensure_csvs(save_path):
         print(f"[MCMC] note: {evals_path} has {evals_width} columns (older "
               f"format); AcceptProb/Accepted will not be recorded there. Delete "
               f"or rename it to get the full header.", flush=True)
-    return all_path, best_path, evals_path, evals_width
+    return all_path, best_path, evals_path, rmse_path, evals_width
 
 
-def _log_eval(evals_path, evals_width, w, params, value, elapsed, details, temp,
+def _eval_row(w, params, value, elapsed, details, temp,
               accept_prob=None, accepted=None):
+    """Build (do not write) one fem_evals.csv row."""
     C = details["C"]; Q = details["Q"]; f = details["f"]
-    row = [w, np.array2string(np.asarray(params), precision=8, separator=","),
-           float(value), elapsed,
-           (float(C.min()) if C.size else ""), (float(Q.mean()) if Q.size else ""),
-           (float(f.min()) if f.size else ""), (float(f.max()) if f.size else ""),
-           float(temp),
-           ("" if accept_prob is None else float(accept_prob)),
-           ("" if accepted is None else bool(accepted))]
-    with open(evals_path, "a", newline="") as fh:
-        csv.writer(fh).writerow(row[:evals_width])
+    return [w, _fmt_arr(params), float(value), elapsed,
+            (float(C.min()) if C.size else ""), (float(Q.mean()) if Q.size else ""),
+            (float(f.min()) if f.size else ""), (float(f.max()) if f.size else ""),
+            float(temp),
+            ("" if accept_prob is None else float(accept_prob)),
+            ("" if accepted is None else bool(accepted))]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _flush_rows(path, rows, width=None):
+    """Append a list of already-built rows, then clear the list."""
+    if not rows:
+        return
+    with open(path, "a", newline="") as fh:
+        wtr = csv.writer(fh)
+        for r in rows:
+            wtr.writerow(r if width is None else r[:width])
+    rows.clear()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# surrogate MLP
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _SurrogateNet(nn.Module):
+    """params -> predicted LOG objective."""
+
+    def __init__(self, d, hidden=SURROGATE_HIDDEN):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden // 2), nn.SiLU(),
+            nn.Linear(hidden // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class Surrogate:
+    """
+    Replay buffer of FOM evaluations plus an MLP approximating them, used to screen
+    candidate proposals so only the most promising one costs a real sweep.
+
+    Trained on the LOG objective (see _to_obj): raw FOM values span ~1e30-1e33, and
+    normalising those directly makes the target scale meaningless.
+
+    DETAILED BALANCE: picking argmin over screened candidates is greedy, not a
+    symmetric Metropolis proposal, so with the surrogate ON the chain is a
+    stochastic optimiser rather than a sampler. The temperature keeps its
+    optimisation role (it is the only thing that accepts uphill moves and escapes
+    a local minimum) but stops being a thermodynamic temperature: heat capacity,
+    relaxation time and constant-thermodynamic-speed cooling all require
+    use_surrogate=False. Screening also inflates the acceptance rate, so do not
+    tune the temperature against it.
+    """
+
+    def __init__(self, input_dim, min_samples=SURROGATE_MIN_SAMPLES,
+                 buffer_size=SURROGATE_BUFFER, hidden=SURROGATE_HIDDEN,
+                 lr=SURROGATE_LR):
+        self.d = int(input_dim)
+        self.min_samples = int(min_samples)
+        self._buf = deque(maxlen=buffer_size)     # training set
+        self._hist_X, self._hist_y = [], []       # full history, in arrival order
+        # pin the dtype at construction and derive it everywhere else: nn.Linear
+        # takes its dtype from the AMBIENT torch default at build time, so a module
+        # built under a different default silently mismatches its own inputs.
+        self.net = _SurrogateNet(self.d, hidden).to(device=_dev, dtype=torch.float64)
+        self.opt = optim.Adam(self.net.parameters(), lr=lr)
+        self.trained = False
+        self._Xmu = np.zeros(self.d); self._Xsi = np.ones(self.d)
+        self._ymu = 0.0; self._ysi = 1.0
+        self.n_trained_on = 0                     # history length at the last fit
+        self.rmse_log = []                        # (n_obs, n_test, holdout rmse)
+        self.train_rmse_log = []                  # (n_obs, first-epoch, final)
+
+    # ---- data ---------------------------------------------------------------
+    def observe(self, params, log_value):
+        p = _as_7(params)
+        self._buf.append((p, float(log_value)))
+        self._hist_X.append(p); self._hist_y.append(float(log_value))
+
+    @property
+    def n_obs(self):
+        return len(self._hist_y)
+
+    @property
+    def ready(self):
+        return self.trained
+
+    # ---- fit ----------------------------------------------------------------
+    def fit(self, epochs=SURROGATE_EPOCHS, batch_size=64, verbose=False,
+            progress_every=SURROGATE_PROGRESS_EVERY):
+        """
+        Refit from scratch on the replay buffer.
+
+        progress_every : print the running TRAINING RMSE every this many epochs,
+            converted back to LOG-OBJECTIVE units (the loss is computed on
+            z-scored targets, so the raw MSE is unitless and unreadable). This is
+            a training score -- it tells you the optimiser is descending, NOT how
+            well the model generalises; holdout_rmse() is the honest number.
+            Set to 0 to silence.
+        """
+        if len(self._buf) < self.min_samples:
+            return False
+        X = np.stack([p for p, _ in self._buf])
+        y = np.array([v for _, v in self._buf], dtype=np.float64)
+        self._Xmu, self._Xsi = X.mean(0), X.std(0) + 1e-8
+        self._ymu, self._ysi = float(y.mean()), float(y.std()) + 1e-8
+
+        dt = next(self.net.parameters()).dtype    # follow the weights, never hardcode
+        Xt = torch.tensor((X - self._Xmu) / self._Xsi, dtype=dt, device=_dev)
+        yt = torch.tensor((y - self._ymu) / self._ysi, dtype=dt, device=_dev)
+        dl = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(Xt, yt),
+            batch_size=batch_size, shuffle=True)
+
+        epochs = int(epochs)
+        if verbose:
+            print(f"[{_ts()}] [surrogate] fitting on {len(self._buf)} samples, "
+                  f"{epochs} epochs (RMSE below is in log-objective units)",
+                  flush=True)
+        self.net.train()
+        first = last = float("nan")
+        t_fit = time.perf_counter()
+        for ep in range(1, epochs + 1):
+            tot = 0.0
+            for xb, yb in dl:
+                self.opt.zero_grad()
+                loss = nn.functional.mse_loss(self.net(xb), yb)
+                loss.backward(); self.opt.step()
+                tot += float(loss.detach()) * xb.shape[0]
+            mse = tot / max(1, Xt.shape[0])
+            # the loss is on z-scored targets; multiply by ysi to get log units
+            last = float(np.sqrt(max(mse, 0.0)) * self._ysi)
+            if ep == 1:
+                first = last
+            if progress_every and (ep % progress_every == 0 or ep == epochs):
+                print(f"[{_ts()}] [surrogate]   epoch {ep:>5}/{epochs} | "
+                      f"train RMSE = {last:.4f}", flush=True)
+        self.trained = True
+        self.n_trained_on = self.n_obs
+        self.train_rmse_log.append((self.n_obs, first, last))
+        if verbose:
+            print(f"[{_ts()}] [surrogate] done in {time.perf_counter()-t_fit:.1f}s | "
+                  f"train RMSE {first:.4f} -> {last:.4f}", flush=True)
+        return True
+
+    # ---- predict ------------------------------------------------------------
+    def batch_predict(self, proposals):
+        """(N, d) -> predicted LOG objective (N,)."""
+        X = np.atleast_2d(np.asarray(proposals, dtype=np.float64))
+        Xn = (X - self._Xmu) / self._Xsi
+        dt = next(self.net.parameters()).dtype
+        self.net.eval()
+        with torch.no_grad():
+            out = self.net(torch.tensor(Xn, dtype=dt, device=_dev)).cpu().numpy()
+        return np.atleast_1d(out) * self._ysi + self._ymu
+
+    # ---- held-out diagnostic ------------------------------------------------
+    def holdout_rmse(self, n_test):
+        """
+        RMSE (in LOG-objective units) on the newest `n_test` evaluations.
+
+        Called immediately BEFORE a refit, so every one of those points arrived
+        after the last fit and is genuinely unseen -- a real generalisation
+        estimate, not a training score. Returns None if not yet fitted or there
+        are not that many unseen points.
+        """
+        if not self.trained:
+            return None
+        n = int(min(n_test, self.n_obs - self.n_trained_on))
+        if n < 1:
+            return None
+        X = np.stack(self._hist_X[-n:])
+        y = np.asarray(self._hist_y[-n:], dtype=np.float64)
+        rmse = float(np.sqrt(np.mean((self.batch_predict(X) - y) ** 2)))
+        self.rmse_log.append((self.n_obs, n, rmse))
+        return rmse
+
+    def get_rmses(self):
+        return list(self.rmse_log)
+
+
+def _seed_surrogate_from_csv(surrogate, evals_path, n_params=N_PARAMS,
+                             verbose=True):
+    """Replay every past evaluation into the surrogate buffer (physical -> log)."""
+    n = 0
+    for _w, p, v in _read_rows(evals_path, n_params):
+        if p is None or not np.isfinite(v):
+            continue
+        surrogate.observe(p, _to_obj(v))
+        n += 1
+    if verbose:
+        print(f"[surrogate] seeded {n} prior evaluations from {evals_path}",
+              flush=True)
+    return n
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # MCMC
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
-def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval"):
+def _new_stats():
+    return {"proposals": 0, "accepted": 0, "improved": 0, "skipped_noop": 0,
+            "rejected_limits": 0, "rejected_form_factor": 0, "failed_eval": 0,
+            "failed_steps": 0, "evaluations": 0, "discarded_partial_evals": 0,
+            "surrogate_screens": 0, "surrogate_fits": 0}
+
+
+def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval",
+              surrogate=None):
     """
     One FOM evaluation (= one full parallel tuning sweep).
 
-    Deliberately does NOT write the CSV row: the acceptance probability is only
-    known after the Metropolis test, so the caller logs once it has both.
+    Does NOT write a CSV row: the acceptance probability is only known after the
+    Metropolis test, and rows are committed a whole iteration at a time.
     Returns (value, details, elapsed).
     """
     if log_each_solve:
@@ -391,6 +653,8 @@ def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval"):
     value, details = fom(params, tuning_steps=tuning_steps, return_details=True)
     elapsed = time.perf_counter() - t0
     stats["evaluations"] += 1
+    if surrogate is not None:                     # every real eval trains the model
+        surrogate.observe(params, _to_obj(value))
     if details["n_failed"]:
         stats["failed_steps"] += details["n_failed"]
     if details["C"].size and details["C"].min() < C_FLOOR:
@@ -403,10 +667,60 @@ def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval"):
     return value, details, elapsed
 
 
+def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
+                           retrain_every, step, n_walkers, log=True,
+                           rmse_rows=None, progress_every=SURROGATE_PROGRESS_EVERY):
+    """
+    Held-out RMSE, then refit. Called ONCE PER COMPLETE MCMC STEP, and the
+    schedule is counted in steps: first fit at `min_steps`, refit every
+    `retrain_every` steps. With n walkers that is n evaluations per step, so the
+    model sees ~min_steps*n and then ~retrain_every*n new evaluations per fit.
+
+    Ordering matters: the RMSE is taken on the newest (retrain_every - 1)*n_walkers
+    evaluations BEFORE the refit that absorbs them, so every scored point arrived
+    after the last fit and is genuinely unseen -- a generalisation estimate, not a
+    training score.
+
+    tstate = {"last_fit_step", "rmse_done"}.
+    """
+    if surrogate is None:
+        return
+    since = step - tstate["last_fit_step"]
+
+    if surrogate.trained and not tstate["rmse_done"] and since >= retrain_every - 1:
+        n_test = (retrain_every - 1) * max(1, n_walkers)
+        r = surrogate.holdout_rmse(n_test)
+        if r is not None:
+            tstate["rmse_done"] = True
+            stats["surrogate_rmse_last"] = round(r, 5)
+            if rmse_rows is not None:
+                _, n_used, _ = surrogate.rmse_log[-1]
+                # buffered, not written here: committed with the rest of the
+                # iteration so an interrupted iteration leaves no orphan row
+                rmse_rows.append([int(step), int(surrogate.n_obs), int(n_used),
+                                  float(r)])
+            if log:
+                print(f"[{_ts()}] [surrogate] step {step} | held-out RMSE "
+                      f"(log-objective units) = {r:.4f}", flush=True)
+
+    need_first = (not surrogate.trained) and step >= tstate["min_steps"]
+    need_refit = surrogate.trained and since >= retrain_every
+    if need_first or need_refit:
+        if surrogate.fit(epochs=surrogate_epochs, verbose=log,
+                         progress_every=progress_every):
+            tstate["last_fit_step"] = step
+            tstate["rmse_done"] = False
+            stats["surrogate_fits"] += 1
+
+
 def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates,
-                 temp, tuning_steps, evals_path, evals_width, stats,
-                 log_each_solve, stuck_warn_every):
-    """One Metropolis step for walker w (exactly one successful FOM evaluation)."""
+                 temp, tuning_steps, stats, log_each_solve, stuck_warn_every,
+                 surrogate=None):
+    """
+    One Metropolis step for walker w (exactly one successful FOM evaluation).
+    Returns (params, value, accepted, eval_row) -- the row is handed back rather
+    than written, so the caller can commit a whole iteration atomically.
+    """
     batch_retries = 0
     while True:
         batch_retries += 1
@@ -429,12 +743,19 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
             continue
 
         candidates = raw[valid]
-        proposal = candidates[np.random.randint(len(candidates))]
+        if surrogate is not None and surrogate.ready:
+            # greedy screen: only the most promising candidate costs a real sweep
+            proposal = candidates[int(np.argmin(surrogate.batch_predict(candidates)))]
+            stats["surrogate_screens"] += 1
+        else:
+            proposal = candidates[np.random.randint(len(candidates))]
 
         try:
             proposal_value, details, elapsed = _evaluate(
                 w, proposal, tuning_steps, stats, log_each_solve, temp,
-                tag=f"step {i:>4}")
+                tag=f"step {i:>4}", surrogate=surrogate)
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             stats["failed_eval"] += 1
             print(f"[{_ts()}] step {i:>4} w{w} | EVAL ERROR | err={e} | "
@@ -449,8 +770,8 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
             accept_prob = 1.0 if d_obj < 0 else min(1.0, float(np.exp(-d_obj / temp)))
 
         accepted = bool(np.random.rand() < accept_prob)
-        _log_eval(evals_path, evals_width, w, proposal, proposal_value, elapsed,
-                  details, temp, accept_prob=accept_prob, accepted=accepted)
+        row = _eval_row(w, proposal, proposal_value, elapsed, details, temp,
+                        accept_prob=accept_prob, accepted=accepted)
         if log_each_solve:
             print(f"[{_ts()}] step {i:>4} w{w} | p_accept={accept_prob:.4g} | "
                   f"accepted={accepted}", flush=True)
@@ -459,116 +780,202 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
             stats["accepted"] += 1
             current_params = proposal
             current_value = proposal_value
-        return current_params, current_value, accepted
+        return current_params, current_value, accepted, row
 
 
 def _run_chains(walker_params, walker_values, best_params, best_value, temp,
                 steps, proposal_std, tuning_steps, all_path, best_path,
-                evals_path, evals_width, save_interval, n_candidates,
+                evals_path, rmse_path, evals_width, save_interval, n_candidates,
                 log_each_solve, stuck_warn_every, stats, desc="MCMC",
-                seed_chain_csv=False):
+                seed_chain_csv=False, surrogate=None,
+                surrogate_epochs=SURROGATE_EPOCHS,
+                surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
+                surrogate_min_steps=SURROGATE_MIN_STEPS,
+                surrogate_last_fit_step=0, surrogate_progress_every=SURROGATE_PROGRESS_EVERY,
+                step_offset=0):
+    """
+    ATOMIC ITERATIONS. Every walker's CSV rows are buffered until the whole
+    iteration finishes. Ctrl-C part-way through an iteration discards that
+    iteration's rows and rolls the in-memory walker state back to the iteration
+    boundary, so fem_evals.csv never contains a ragged partial group and the
+    files stay consistent with what continue_mcmc will read back.
+    """
     n_walkers = len(walker_params)
     chains_params = [[p.copy()] for p in walker_params]
     chains_values = [[v] for v in walker_values]
-    pending_rows = ([(w, walker_params[w].copy(), walker_values[w])
-                     for w in range(n_walkers)] if seed_chain_csv else [])
+    pending_chain = ([[w, _fmt_arr(walker_params[w]), walker_values[w]]
+                      for w in range(n_walkers)] if seed_chain_csv else [])
+    pending_evals, pending_rmse = [], []
     accepted_per_walker = [0] * n_walkers
     evals_at_start = stats["evaluations"]
+    tstate = {"last_fit_step": int(surrogate_last_fit_step),
+              "min_steps": int(surrogate_min_steps), "rmse_done": False}
+    interrupted = False
 
     pbar = tqdm(range(steps), desc=desc)
     for i in pbar:
-        temp = max(TEMP_MIN, temp * COOLING)
+        # snapshot the iteration boundary so a partial iteration can be undone
+        snap = ([p.copy() for p in walker_params], list(walker_values),
+                best_params.copy(), best_value, list(accepted_per_walker),
+                stats["accepted"])
+        iter_evals, iter_chain, iter_rmse = [], [], []
+        iter_improved = 0
+        try:
+            temp = max(TEMP_MIN, temp * COOLING)
+            for w in range(n_walkers):
+                # NOTE: named cur_val, NOT cv -- `fem` is the solver module and
+                # shadowing a module alias here breaks any later module call.
+                cur_par, cur_val, accepted, row = _walker_step(
+                    w, i, walker_params[w], walker_values[w], proposal_std,
+                    n_candidates, temp, tuning_steps, stats, log_each_solve,
+                    stuck_warn_every, surrogate=surrogate)
+                iter_evals.append(row)
+                walker_params[w], walker_values[w] = cur_par, cur_val
+                if accepted:
+                    accepted_per_walker[w] += 1
+                    if float(cur_val) < float(best_value):
+                        iter_improved += 1
+                        best_params = cur_par.copy()
+                        best_value = cur_val
+                iter_chain.append([w, _fmt_arr(cur_par), cur_val])
+            # ONCE PER COMPLETE STEP -- the schedule counts steps, not evaluations
+            _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
+                                   surrogate_retrain_every,
+                                   step=step_offset + i + 1, n_walkers=n_walkers,
+                                   log=log_each_solve, rmse_rows=iter_rmse,
+                                   progress_every=surrogate_progress_every)
+        except KeyboardInterrupt:
+            # roll the iteration back; its rows are never written
+            (walker_params, walker_values, best_params, best_value,
+             accepted_per_walker) = snap[0], snap[1], snap[2], snap[3], snap[4]
+            # roll the accept counter back too, or the reported acceptance rate
+            # keeps a numerator from an iteration whose denominator was discarded
+            stats["accepted"] = snap[5]
+            stats["discarded_partial_evals"] += len(iter_evals)
+            interrupted = True
+            print(f"\n[{_ts()}] interrupted during iteration {i}: discarding "
+                  f"{len(iter_evals)}/{n_walkers} partial walker row(s); the CSVs "
+                  f"end at the last COMPLETE iteration.", flush=True)
+            break
 
+        # ---- the iteration completed: commit it ----------------------------
+        stats["improved"] += iter_improved
+        pending_evals.extend(iter_evals)
+        pending_chain.extend(iter_chain)
+        pending_rmse.extend(iter_rmse)
         for w in range(n_walkers):
-            # NOTE: the returned value is named cur_val, NOT cv -- `cv`/`fem` is
-            # the solver module and shadowing it here silently breaks any later
-            # module call inside this function.
-            cur_par, cur_val, accepted = _walker_step(
-                w, i, walker_params[w], walker_values[w], proposal_std,
-                n_candidates, temp, tuning_steps, evals_path, evals_width,
-                stats, log_each_solve, stuck_warn_every)
-            walker_params[w], walker_values[w] = cur_par, cur_val
-            if accepted:
-                accepted_per_walker[w] += 1
-                if float(cur_val) < float(best_value):
-                    stats["improved"] += 1
-                    best_params = cur_par.copy()
-                    best_value = cur_val
-            chains_params[w].append(cur_par.copy())
-            chains_values[w].append(cur_val)
-            pending_rows.append((w, cur_par.copy(), cur_val))
+            chains_params[w].append(walker_params[w].copy())
+            chains_values[w].append(walker_values[w])
 
-        pbar.set_postfix({"best": f"{float(best_value):.4g}",
-                          "evals": stats["evaluations"],
-                          "T": f"{temp:.3g}"})
-        pbar.refresh()
+        post = {"best": f"{float(best_value):.4g}",
+                "evals": stats["evaluations"], "T": f"{temp:.3g}"}
+        if surrogate is not None:
+            post["sur"] = "on" if surrogate.ready else "cold"
+            if surrogate.rmse_log:
+                post["rmse"] = f"{surrogate.rmse_log[-1][2]:.3f}"
+        pbar.set_postfix(post); pbar.refresh()
 
-        if save_interval and i % save_interval == 0:
-            with open(all_path, "a", newline="") as fh:
-                wtr = csv.writer(fh)
-                for row_w, p, v in pending_rows:
-                    wtr.writerow([row_w, np.array2string(p, precision=8,
-                                                         separator=","), v])
-            pending_rows = []
+        if save_interval and (i % save_interval == 0):
+            _flush_rows(evals_path, pending_evals, evals_width)
+            _flush_rows(all_path, pending_chain)
+            _flush_rows(rmse_path, pending_rmse)
 
-    with open(all_path, "a", newline="") as fh:
-        wtr = csv.writer(fh)
-        for row_w, p, v in pending_rows:
-            wtr.writerow([row_w, np.array2string(p, precision=8, separator=","), v])
+    # final flush (only ever whole iterations)
+    _flush_rows(evals_path, pending_evals, evals_width)
+    _flush_rows(all_path, pending_chain)
+    _flush_rows(rmse_path, pending_rmse)
     with open(best_path, "w", newline="") as fh:
         wtr = csv.writer(fh)
         wtr.writerow(["Parameters", "Value"])
-        wtr.writerow([np.array2string(np.asarray(best_params), precision=8,
-                                      separator=","), best_value])
+        wtr.writerow([_fmt_arr(best_params), best_value])
 
+    done = len(chains_values[0]) - 1
     session = stats["evaluations"] - evals_at_start
+    if interrupted:
+        print(f"[{_ts()}] stopped after {done} complete iteration(s) of {steps}.",
+              flush=True)
     print(f"\nFOM evaluations this session: {session} "
-          f"({steps} steps x {n_walkers} walkers + retries)")
+          f"({done} complete iterations x {n_walkers} walkers + retries)")
     print("\nMCMC diagnostics:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print(f"  acceptance rate (per walker-step): "
-          f"{stats['accepted'] / max(1, steps * n_walkers):.3f}")
+          f"{stats['accepted'] / max(1, done * n_walkers):.3f}")
     for w in range(n_walkers):
-        print(f"    walker {w}: {accepted_per_walker[w] / max(1, steps):.3f} "
+        print(f"    walker {w}: {accepted_per_walker[w] / max(1, done):.3f} "
               f"| final FOM={float(walker_values[w]):.4g}")
+    if surrogate is not None and surrogate.rmse_log:
+        print("\n  surrogate held-out RMSE (log-objective units):")
+        for n_obs, n_test, r in surrogate.rmse_log:
+            print(f"    after {n_obs:>5} evals | test n={n_test:>3} | RMSE={r:.4f}")
+        print(f"    -> appended to {rmse_path}")
     return best_params, best_value, chains_params, chains_values
 
 
 def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
                   save_path="./csvs/", save_interval=1, n_candidates=64,
                   log_each_solve=True, stuck_warn_every=25, n_walkers=1,
-                  init_jitter=0.05):
+                  init_jitter=0.05,
+                  use_surrogate=False,
+                  surrogate_min_steps=SURROGATE_MIN_STEPS,
+                  surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
+                  surrogate_epochs=SURROGATE_EPOCHS,
+                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY):
     """
     Multi-walker simulated-annealing MCMC minimising the FEM scan-time FOM.
 
-    initial_params : (d,) in MILLIMETRES -> walker 0 starts there, others at
-        log-jittered copies; or (n_walkers, d) to set every start explicitly.
+    initial_params : (7,) in MILLIMETERS -> walker 0 starts there, others at
+        log-jittered copies; or (n_walkers, 7) to set every start explicitly.
+        A legacy 8-vector is accepted and its gap1 entry dropped.
 
-    Each FOM evaluation runs a full tuning sweep, and THAT sweep is what uses all
-    the cores (fem.run_sweep). Walkers are advanced sequentially so the parallel
-    work is not oversubscribed.
+    use_surrogate : train an MLP on the log objective and use it to screen the
+        candidate batch, so only the most promising proposal costs a real sweep.
+        The schedule counts MCMC STEPS: first fit after `surrogate_min_steps`,
+        refit every `surrogate_retrain_every` steps, `surrogate_epochs` epochs
+        each. One step is n_walkers evaluations, so with n walkers the first fit
+        sees ~100n evaluations and each refit adds ~50n. A held-out RMSE on the
+        newest (retrain_every-1)*n_walkers unseen evaluations is reported just
+        before every refit, and the training RMSE is printed every
+        `surrogate_progress_every` epochs so you can watch a fit converge.
+
+        OFF by default: argmin screening is greedy and breaks detailed balance.
+        See the Surrogate docstring for what that costs.
+
+    Ctrl-C is safe: the run stops at the last COMPLETE iteration and the CSVs are
+    left consistent with it.
+
+    The surrogate held-out RMSE is appended to save_path/surrogate_rmse.csv with
+    columns Iteration, NEvals, NTest, RMSE -- ready to plot directly, and appended
+    to (not overwritten) on resume so the series spans sessions.
 
     Returns (best_params, best_value, chains_params, chains_values).
     """
-    stats = {"proposals": 0, "accepted": 0, "improved": 0, "skipped_noop": 0,
-             "rejected_limits": 0, "rejected_form_factor": 0, "failed_eval": 0,
-             "failed_steps": 0, "evaluations": 0}
-
-    all_path, best_path, evals_path, evals_width = _ensure_csvs(save_path)
+    stats = _new_stats()
+    all_path, best_path, evals_path, rmse_path, evals_width = _ensure_csvs(save_path)
     walker_params = _init_walker_params(initial_params, n_walkers, init_jitter)
-    n_params = walker_params[0].size
+    n_p = walker_params[0].size
     proposal_std = (np.asarray(proposal_std, dtype=np.float64)
                     if np.ndim(proposal_std) > 0
-                    else np.full(n_params, float(proposal_std)))
+                    else np.full(n_p, float(proposal_std)))
 
-    walker_values = []
+    surrogate = None
+    if use_surrogate:
+        surrogate = Surrogate(n_p)
+        print(f"[surrogate] ON  | first fit at step {surrogate_min_steps} "
+              f"(~{surrogate_min_steps * n_walkers} evals), refit every "
+              f"{surrogate_retrain_every} steps (~{surrogate_retrain_every*n_walkers} "
+              f"evals), {surrogate_epochs} epochs", flush=True)
+
+    # baseline evaluations are not proposals -> AcceptProb/Accepted blank.
+    # They are their own complete group, so they commit immediately.
+    walker_values, init_rows = [], []
     for w in range(n_walkers):
         v, det, el = _evaluate(w, walker_params[w], tuning_steps, stats,
-                               log_each_solve, TEMP0, tag="init")
-        # baseline evaluations are not proposals -> AcceptProb/Accepted blank
-        _log_eval(evals_path, evals_width, w, walker_params[w], v, el, det, TEMP0)
+                               log_each_solve, TEMP0, tag="init",
+                               surrogate=surrogate)
+        init_rows.append(_eval_row(w, walker_params[w], v, el, det, TEMP0))
         walker_values.append(v)
+    _flush_rows(evals_path, init_rows, evals_width)
 
     best_w = int(np.argmin([float(v) for v in walker_values]))
     best_params = walker_params[best_w].copy()
@@ -576,41 +983,42 @@ def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
 
     return _run_chains(walker_params, walker_values, best_params, best_value,
                        TEMP0, steps, proposal_std, tuning_steps, all_path,
-                       best_path, evals_path, evals_width, save_interval,
-                       n_candidates, log_each_solve, stuck_warn_every, stats,
-                       desc="MCMC", seed_chain_csv=True)
+                       best_path, evals_path, rmse_path, evals_width,
+                       save_interval, n_candidates, log_each_solve,
+                       stuck_warn_every, stats,
+                       desc="MCMC", seed_chain_csv=True, surrogate=surrogate,
+                       surrogate_epochs=surrogate_epochs,
+                       surrogate_retrain_every=surrogate_retrain_every,
+                       surrogate_min_steps=surrogate_min_steps,
+                       surrogate_last_fit_step=0,
+                       surrogate_progress_every=surrogate_progress_every,
+                       step_offset=0)
 
-def NM_opt(x0, max_iters): 
-    res = scipy.optimize.minimize(fom, x0, method="Nelder-Mead", 
-                                  options={"disp": True, "maxiter": max_iters})
-    return res.x
- 
-def _fmt_arr(p):
-    """
-    One-line array repr for the CSVs. np.array2string wraps at 75 characters by
-    default, which puts newlines INSIDE a csv field -- legal, but awkward to read
-    and to grep. The parser below copes with either form, so old files still load.
-    """
-    return np.array2string(np.asarray(p, dtype=np.float64), precision=8,
-                           separator=",", max_line_width=10**6)
- 
- 
-def _parse_params(cell, n_params=8):
+
+# ═════════════════════════════════════════════════════════════════════════════
+# resume
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _parse_params(cell, n_params=N_PARAMS):
     nums = _NUM.findall(str(cell))
     if len(nums) < n_params:
         return None
+    vals = [float(x) for x in nums[:max(n_params, 8)][:8]]
+    if len(nums) >= 8 and n_params == N_PARAMS:
+        # an 8-number cell is a legacy row: drop the gap1 entry
+        return np.delete(np.array(vals[:8], dtype=np.float64), 3)
     return np.array([float(x) for x in nums[:n_params]], dtype=np.float64)
- 
- 
+
+
 def _parse_value(cell):
     try:
         return float(cell)
     except (TypeError, ValueError):
         m = _NUM.findall(str(cell))
         return float(m[0]) if m else np.nan
- 
- 
-def _read_rows(path, n_params=8):
+
+
+def _read_rows(path, n_params=N_PARAMS):
     """Read a Walker|Parameters|Value CSV -> list of (walker, params, value)."""
     rows = []
     if not os.path.exists(path):
@@ -637,26 +1045,26 @@ def _read_rows(path, n_params=8):
                 continue
             rows.append((wid, p, v))
     return rows
- 
- 
-def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
+
+
+def load_mcmc_state(save_path="./csvs/", n_params=N_PARAMS, n_walkers=1,
                     init_jitter=0.05):
     """
     Rebuild everything needed to resume, from the CSVs written by mcmc_minimize.
- 
-    Walker positions come from all_params_all_values.csv, which is the CHAIN
-    (one row per walker per step, repeats included when a proposal is rejected).
+
+    Walker positions come from all_params_all_values.csv, which is the CHAIN (one
+    row per walker per step, repeats included when a proposal is rejected).
     fem_evals.csv is NOT used for this: its last row is the last PROPOSAL, which
     is usually not the accepted state. The evals file is only a fallback if the
-    chain file is missing, and a count of prior evaluations for the diagnostics.
- 
+    chain file is missing, plus a count of prior evaluations.
+
     Returns dict: walkers [{params, value}], best_params, best_value,
-    n_steps_done, n_prior_evals.
+    n_steps_done, n_prior_evals, source.
     """
     all_path   = os.path.join(save_path, "all_params_all_values.csv")
     best_path  = os.path.join(save_path, "best_params_best_values.csv")
     evals_path = os.path.join(save_path, "fem_evals.csv")
- 
+
     chain = _read_rows(all_path, n_params)
     source = "all_params_all_values.csv (chain states)"
     if not chain:
@@ -666,8 +1074,7 @@ def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
         raise FileNotFoundError(
             f"no resumable rows in {all_path} or {evals_path}. Run mcmc_minimize "
             f"first, or check save_path.")
- 
-    # last state and row count per walker id present in the file
+
     last_state, per_walker = {}, {}
     for wid, p, v in chain:
         last_state[wid] = (p, v)
@@ -675,8 +1082,7 @@ def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
     # the chain file is seeded with one row per walker before stepping, so the
     # number of completed steps is (rows - 1)
     n_steps_done = max(0, max(per_walker.values()) - 1)
- 
-    # global best
+
     best_params = best_value = None
     best_rows = _read_rows(best_path, n_params)
     if best_rows:
@@ -686,7 +1092,7 @@ def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
         if not pool:
             pool = [(p, v) for _w, p, v in chain]
         best_params, best_value = min(pool, key=lambda pv: pv[1])
- 
+
     walkers = []
     for w in range(n_walkers):
         if w in last_state:
@@ -697,42 +1103,44 @@ def load_mcmc_state(save_path="./csvs/", n_params=8, n_walkers=1,
             walkers.append({"params": _jitter_within_limits(
                 np.asarray(best_params, dtype=np.float64), init_jitter),
                 "value": None})          # unknown -> evaluated by continue_mcmc
- 
+
     extra = sorted(set(last_state) - set(range(n_walkers)))
     if extra:
         print(f"[resume] NOTE: the file also contains walkers {extra}; they are "
               f"ignored because n_walkers={n_walkers}.", flush=True)
- 
-    n_prior_evals = len(_read_rows(evals_path, n_params))
+
     return {"walkers": walkers,
             "best_params": np.asarray(best_params, dtype=np.float64),
             "best_value": float(best_value),
             "n_steps_done": int(n_steps_done),
-            "n_prior_evals": int(n_prior_evals),
+            "n_prior_evals": int(len(_read_rows(evals_path, n_params))),
             "source": source}
- 
- 
+
+
 def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
                   save_interval=1, n_candidates=64, log_each_solve=True,
                   stuck_warn_every=25, start_from="last", start_temp=None,
-                  n_walkers=1, init_jitter=0.05, n_params=8):
+                  n_walkers=1, init_jitter=0.05, n_params=N_PARAMS,
+                  use_surrogate=False,
+                  surrogate_min_steps=SURROGATE_MIN_STEPS,
+                  surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
+                  surrogate_epochs=SURROGATE_EPOCHS,
+                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY):
     """
-    Resume a run from its CSVs.
- 
+    Resume a run from its CSVs. See mcmc_minimize for use_surrogate semantics.
+
     start_from : "last" -> every walker resumes from its own last chain state
                  "best" -> walker 0 restarts at the global best, the rest at
                            log-jittered copies of it
-    start_temp : override the annealing temperature. Otherwise it is rebuilt from
-                 the schedule, TEMP0 * COOLING**n_steps_done (floored at TEMP_MIN),
-                 which is exact here because the cooling is geometric -- if you
-                 ever switch to an adaptive schedule this must be persisted to a
-                 file instead, since it stops being a closed form of the step index.
- 
-    Walkers with no stored state (e.g. resuming a 1-walker run with n_walkers=4)
-    each cost one fresh FOM evaluation before stepping.
- 
-    Returns (best_params, best_value, chains_params, chains_values), as
-    mcmc_minimize does.
+    start_temp : override the annealing temperature. Otherwise rebuilt from the
+                 schedule, TEMP0 * COOLING**n_steps_done (floored at TEMP_MIN),
+                 exact here because the cooling is geometric -- an adaptive
+                 schedule would have to be persisted to a file instead.
+
+    On resume the surrogate is SEEDED from fem_evals.csv and fitted immediately if
+    there is enough data, so a continued run does not spend another
+    `surrogate_min_steps` steps relearning what the last session paid for. The
+    refit schedule then continues from the resumed step count.
     """
     state = load_mcmc_state(save_path, n_params, n_walkers, init_jitter)
     print(f"[resume] source        : {state['source']}", flush=True)
@@ -740,13 +1148,11 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
           f"({state['n_prior_evals']} prior evaluations)", flush=True)
     print(f"[resume] best so far   : {state['best_value']:.6g}", flush=True)
     print(f"[resume] best params   : {_fmt_params(state['best_params'])}", flush=True)
- 
-    stats = {"proposals": 0, "accepted": 0, "improved": 0, "skipped_noop": 0,
-             "rejected_limits": 0, "rejected_form_factor": 0, "failed_eval": 0,
-             "failed_steps": 0, "evaluations": state["n_prior_evals"]}
- 
-    all_path, best_path, evals_path, evals_width = _ensure_csvs(save_path)
- 
+
+    stats = _new_stats()
+    stats["evaluations"] = state["n_prior_evals"]
+    all_path, best_path, evals_path, rmse_path, evals_width = _ensure_csvs(save_path)
+
     if start_from == "best":
         walker_params = [state["best_params"].copy()]
         walker_values = [state["best_value"]]
@@ -759,39 +1165,97 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
         walker_values = [wk["value"] for wk in state["walkers"]]
     else:
         raise ValueError("start_from must be 'last' or 'best'")
- 
+
     best_params = state["best_params"].copy()
     best_value = state["best_value"]
- 
+
     n_p = walker_params[0].size
     proposal_std = (np.asarray(proposal_std, dtype=np.float64)
                     if np.ndim(proposal_std) > 0
                     else np.full(n_p, float(proposal_std)))
- 
-    # temperature
+
+    surrogate = None
+    last_fit_step = 0
+    if use_surrogate:
+        surrogate = Surrogate(n_p)
+        _seed_surrogate_from_csv(surrogate, evals_path, n_params)
+        if surrogate.n_obs >= max(SURROGATE_MIN_SAMPLES,
+                                  surrogate_min_steps * n_walkers):
+            surrogate.fit(epochs=surrogate_epochs, verbose=True,
+                          progress_every=surrogate_progress_every)
+            last_fit_step = state["n_steps_done"]
+            stats["surrogate_fits"] += 1
+        print(f"[surrogate] ON  | seeded {surrogate.n_obs} evals | "
+              f"ready={surrogate.ready} | next refit at step "
+              f"{last_fit_step + surrogate_retrain_every}", flush=True)
+
     if start_temp is not None:
         temp, src = float(start_temp), "start_temp argument"
     else:
         temp = max(TEMP_MIN, TEMP0 * (COOLING ** state["n_steps_done"]))
         src = f"schedule TEMP0*{COOLING}^{state['n_steps_done']}"
     print(f"[resume] starting temp : {temp:.6g}  ({src})", flush=True)
- 
-    # evaluate any walker whose value is unknown (freshly seeded)
+
+    seed_rows = []
     for w in range(n_walkers):
         if walker_values[w] is None:
             v, det, el = _evaluate(w, walker_params[w], tuning_steps, stats,
-                                   log_each_solve, temp, tag="seed")
-            _log_eval(evals_path, evals_width, w, walker_params[w], v, el, det, temp)
+                                   log_each_solve, temp, tag="seed",
+                                   surrogate=surrogate)
+            seed_rows.append(_eval_row(w, walker_params[w], v, el, det, temp))
             walker_values[w] = v
             if float(v) < float(best_value):
                 best_params, best_value = walker_params[w].copy(), v
- 
+    _flush_rows(evals_path, seed_rows, evals_width)
+
     return _run_chains(walker_params, walker_values, best_params, best_value,
                        temp, steps, proposal_std, tuning_steps, all_path,
-                       best_path, evals_path, evals_width, save_interval,
-                       n_candidates, log_each_solve, stuck_warn_every, stats,
+                       best_path, evals_path, rmse_path, evals_width,
+                       save_interval, n_candidates, log_each_solve,
+                       stuck_warn_every, stats,
                        desc="MCMC(resume)",
                        # the resumed states are already the last rows of the chain
                        # file; re-seeding would duplicate them and inflate the step
                        # count on the NEXT resume
-                       seed_chain_csv=False)
+                       seed_chain_csv=False, surrogate=surrogate,
+                       surrogate_epochs=surrogate_epochs,
+                       surrogate_retrain_every=surrogate_retrain_every,
+                       surrogate_min_steps=surrogate_min_steps,
+                       surrogate_last_fit_step=last_fit_step,
+                       surrogate_progress_every=surrogate_progress_every,
+                       # cumulative iteration index, so surrogate_rmse.csv is a
+                       # continuous series across resumes rather than restarting
+                       step_offset=state["n_steps_done"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Nelder-Mead refinement
+# ═════════════════════════════════════════════════════════════════════════════
+
+def NM_opt(x0, max_iters, tuning_steps=16):
+    """
+    Local refinement of a single geometry, on the RAW objective -- no constraint
+    penalty. Nelder-Mead therefore never sees a plateau of tied PENALTY values and
+    keeps full ordering information everywhere it steps.
+
+    The trade: NM will actually evaluate geometries outside the limits, which
+    costs real FEM sweeps, and -- the part that matters -- an infeasible geometry
+    can mesh and solve perfectly well and return an excellent FOM. NM will happily
+    converge onto one. The returned point is checked and a warning printed, but
+    the check is only a report: ALWAYS run proposed_params_within_limits() on the
+    result before treating it as a design.
+
+    Feed it an MCMC optimum; do NOT feed its trajectory back into the MCMC or the
+    surrogate -- hundreds of near-identical points in one basin distort the
+    surrogate fit and add nothing to the chain.
+    """
+    res = scipy.optimize.minimize(
+        lambda x: fom(x, tuning_steps=tuning_steps), _as_7(x0),
+        method="Nelder-Mead", options={"disp": True, "maxiter": max_iters})
+
+    if not proposed_params_within_limits(res.x):
+        print(f"\n[NM_opt] WARNING: the converged point VIOLATES the limits and is "
+              f"not a buildable geometry:\n  {_fmt_params(res.x)}\n"
+              f"  FOM={float(res.fun):.6g}. Re-run from a different start, or "
+              f"clamp the offending parameter and re-refine.", flush=True)
+    return res.x

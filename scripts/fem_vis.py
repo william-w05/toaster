@@ -23,7 +23,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")           # safe on headless machines; remove for interactive
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle as MplCircle, Rectangle as MplRect, Wedge as MplWedge
+from matplotlib.patches import Rectangle as MplRect
 
 from . import fem_solve as cv
 
@@ -45,10 +45,10 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
     """
     Draw the geometry from the spec alone -- no gmsh, no meshing. Instant, so use
     it as the fast feedback loop while building a layout.
- 
+
     Metal (setminus) rectangles are hatched; dielectrics are filled and labelled
     with their eps_r. Centres are marked, since rectangles are specified by centre.
- 
+
     zoom : None    -> show the whole cavity
            "metal" -> fit to the inclusions (useful when a small assembly sits in
                       a much larger cavity, where the whole view hides the detail)
@@ -56,14 +56,9 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
     created = ax is None
     if created:
         fig, ax = plt.subplots(figsize=(9, 6))
- 
-    if isinstance(spec, cv.HalfPipeSpec):
-        cx, cy = spec.center
-        ax.add_patch(MplWedge((cx * MM, cy * MM), spec.radius * MM,
-                              theta1=0.0, theta2=180.0,
-                              facecolor="#eaf3fb", edgecolor="#1f4e79",
-                              lw=2.0, zorder=0))
-    elif isinstance(spec, cv.CylSpec):
+
+    if hasattr(spec, "radius"):                     # CylSpec
+        from matplotlib.patches import Circle as MplCircle
         cx, cy = spec.center
         ax.add_patch(MplCircle((cx * MM, cy * MM), spec.radius * MM,
                                facecolor="#eaf3fb", edgecolor="#1f4e79",
@@ -73,7 +68,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
         ax.add_patch(MplRect((o.x0 * MM, o.y0 * MM), o.w * MM, o.h * MM,
                              facecolor="#eaf3fb", edgecolor="#1f4e79",
                              lw=2.0, zorder=0))
- 
+
     for i, r in enumerate(spec.metal):
         ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
                              facecolor="#9aa5b1", edgecolor="#33404d", lw=1.4,
@@ -82,7 +77,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
             _label(ax, r, f"{r.name}  {r.w*MM:.1f}x{r.h*MM:.1f}", i)
- 
+
     for i, (r, mat) in enumerate(spec.dielectric):
         ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
                              facecolor="#f6d9a0", edgecolor="#a8791f", lw=1.4,
@@ -91,7 +86,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
             _label(ax, r, f"{mat.name} $\\epsilon_r$={mat.eps_r:g}", i)
- 
+
     if zoom == "metal" and (spec.metal or spec.dielectric):
         rs = list(spec.metal) + [r for r, _ in spec.dielectric]
         x0 = min(r.x0 for r in rs); x1 = max(r.x0 + r.w for r in rs)
@@ -117,6 +112,7 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return ax
 
+
 def _overlap_warnings(spec, ax):
     """Flag rectangles that overlap or stick out -- the usual layout mistakes."""
     msgs = []
@@ -138,6 +134,7 @@ def _overlap_warnings(spec, ax):
                 transform=ax.transAxes, va="top", ha="left", fontsize=8,
                 color="#a11", bbox=dict(fc="#ffecec", ec="#a11", alpha=0.9))
     return msgs
+
 
 def check_spec(spec, verbose=True):
     """Non-graphical version of the same checks. Returns a list of problems."""
@@ -168,10 +165,10 @@ def plot_mesh(spec, save=None, show_regions=True, lw=0.25, title=None):
     except OSError:
         pass
     p, t = m.p, m.t
- 
+
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.triplot(p[0] * MM, p[1] * MM, t.T, lw=lw, color="#7a8b99", alpha=0.8)
- 
+
     if show_regions:
         colors = ["#eaf3fb", "#f6d9a0", "#cfe8cf", "#f2c8c8", "#ded0ef"]
         names = ["background"] + [f"diel_{i}" for i in range(len(diel_mats))]
@@ -187,7 +184,7 @@ def plot_mesh(spec, save=None, show_regions=True, lw=0.25, title=None):
         if nm in m.boundaries:
             f = m.facets[:, m.boundaries[nm]]
             ax.plot(p[0][f] * MM, p[1][f] * MM, color=col, lw=1.8)
- 
+
     ax.set_aspect("equal"); ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)")
     ax.set_title(title or f"mesh: {spec.tag or ''}  {t.shape[1]} elements  "
                           f"(blue = wall BC, red = cut-out/metal BC)")
@@ -236,40 +233,6 @@ def plot_modes(spec, result, n=None, save=None, cmap="RdBu_r"):
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return fig
 
-def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
-    """
-    |E|^2 of each mode, annotated with f / C / Q / localisation.
-    """
-    if "fields" not in result:
-        raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
-    m = result["mesh"]
-    nmodes = len(result["fields"]) if n is None else min(n, len(result["fields"]))
-    ncol = min(3, nmodes); nrow = int(np.ceil(nmodes / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 3.4 * nrow),
-                                squeeze=False)
-    nv = m.p.shape[1]
-    for i in range(nmodes):
-        ax = axes[i // ncol][i % ncol]
-        u = result["fields"][i][:nv]          # P2: vertex dofs come first
-        val = np.abs(u) ** 2
-        lim = np.max(val) or 1.0
-        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
-                            cmap=cmap, vmin=0.0, vmax=lim, shading="gouraud")
-        for nm, col in (("wall", "#111111"), ("metal", "#111111")):
-            if nm in m.boundaries:
-                f = m.facets[:, m.boundaries[nm]]
-                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
-        md = result["modes"][i]
-        ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
-                        f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
-        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(tp, ax=ax, fraction=0.035)
-    for j in range(nmodes, nrow * ncol):
-        axes[j // ncol][j % ncol].axis("off")
-    fig.suptitle(f"E_z modes: {spec.tag or ''}", y=1.0)
-    if save:
-        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
-    return fig
 
 # ─────────────────────────────────────────────────────────────────────────────
 def _pick_best(result, min_localisation=0.0):
@@ -340,65 +303,6 @@ def plot_best_modes(entries, save=None, cmap="RdBu_r", ncol=4,
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return fig
 
-def plot_best_modes_magnitude_square(entries, save=None, cmap="RdBu_r", ncol=4,
-                    min_localisation=0.0, suptitle=None, share_scale=False):
-    """
-    Field of the HIGHEST-FORM-FACTOR mode (|E|^2) at every tuning position, one panel per
-    step, so you can watch the operating mode evolve across the scan.
-
-    entries : list of (spec, result) or (spec, result, label). Every result must
-              come from solve_cavity(..., keep_fields=True). Each tuning position
-              has its own geometry and therefore its own mesh, which is why the
-              meshes are drawn per panel rather than reused.
-    min_localisation : forwarded to the mode choice -- set it > 0 to pick the best
-              DELOCALISED mode instead of letting argmax(C) grab a localised one.
-    share_scale : use one colour scale across panels instead of normalising each.
-              Per-panel (default) shows mode shape best; shared shows amplitude loss.
-    """
-    ents = [(e[0], e[1], (e[2] if len(e) > 2 else "")) for e in entries]
-    for _, r, _lab in ents:
-        if "fields" not in r:
-            raise ValueError("a result has no fields: "
-                             "call solve_cavity(..., keep_fields=True)")
-    n = len(ents)
-    ncol = min(ncol, n)
-    nrow = int(np.ceil(n / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 3.9 * nrow),
-                             squeeze=False)
-
-    picks = [_pick_best(r, min_localisation) for _, r, _l in ents]
-    gmax = 1.0
-    if share_scale:
-        gmax = max(np.max(np.abs(r["fields"][i][:r["mesh"].p.shape[1]]))
-                   for (_, r, _l), i in zip(ents, picks)) or 1.0
-
-    for k, ((spec, r, lab), i) in enumerate(zip(ents, picks)):
-        ax = axes[k // ncol][k % ncol]
-        m = r["mesh"]
-        nv = m.p.shape[1]
-        u = r["fields"][i][:nv]
-        val = np.abs(u) ** 2
-        lim = gmax if share_scale else (np.max(val) or 1.0)
-        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
-                          cmap=cmap, vmin=0.0, vmax=lim, shading="gouraud")
-        for nm in ("wall", "metal"):
-            if nm in m.boundaries:
-                f = m.facets[:, m.boundaries[nm]]
-                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color="#111111", lw=0.9)
-        md = r["modes"][i]
-        head = (lab + "\n") if lab else ""
-        ax.set_title(f"{head}f={r['freqs'][i]/1e9:.3f} GHz  C={md['C']:.3f}\n"
-                     f"Q={md['Q']:.3g}  loc={md['localisation']:.3f}", fontsize=8)
-        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(tp, ax=ax, fraction=0.04)
-    for j in range(n, nrow * ncol):
-        axes[j // ncol][j % ncol].axis("off")
-
-    fig.suptitle(suptitle or "highest form-factor mode across the tuning range",
-                 y=1.0, fontsize=11)
-    if save:
-        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
-    return fig
 
 def plot_tuning_summary(entries, save=None, min_localisation=0.0, xvals=None,
                         xlabel="tuning step"):
@@ -429,17 +333,25 @@ def plot_tuning_summary(entries, save=None, min_localisation=0.0, xvals=None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010,
+def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010, gap1=None,
                  toast_dx=0.0, toast_dy=0.0, mesh_size=0.002, tag="toaster",
-                 wall_material=None, metal_material=None,
-                 center_x=None, center_y=None, mesh_uniform=False):
+                 wall_material=None, metal_material=None, mesh_uniform=False,
+                 center_x=None, center_y=None):
     """
-    Build a CavitySpec from your 8-vector, centred on the origin.
+    Build a CavitySpec from the parameter vector, centred on the origin.
 
-    params (METRES for lengths, degrees for the angle), in get_T_scan order:
-        0 tuning angle | 1 divider_height | 2 divider_width | 3 gap1
+    params (METRES for lengths, degrees for the angle). BOTH lengths are accepted:
+
+      7-vector (gap1 fixed, current):
+        0 angle | 1 divider_height | 2 divider_width | 3 center_toast_width
+        4 side_toast_width | 5 center_toast_height | 6 side_toast_height
+        -> gap1 comes from the `gap1` argument (defaulting to gap0)
+
+      8-vector (legacy, gap1 optimised):
+        0 angle | 1 divider_height | 2 divider_width | 3 gap1
         4 center_toast_width | 5 side_toast_width | 6 center_toast_height
         7 side_toast_height
+        -> gap1 comes from params[3] unless the `gap1` argument overrides it
     toast_dx, toast_dy : tuning displacement applied to ALL THREE TOASTS together
         (centre + both side toasts). The DIVIDERS and the walls stay fixed -- they
         are the shell structure, the toasts are the tuning elements.
@@ -476,7 +388,18 @@ def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010,
 
     PLOT IT AND CHECK IT AGAINST YOUR COMSOL MODEL before trusting any number.
     """
-    _, div_h, div_w, gap1, ctr_w, side_w, ctr_h, side_h = [float(v) for v in params]
+    p = [float(x) for x in np.asarray(params).ravel()]
+    if len(p) == 7:
+        _, div_h, div_w, ctr_w, side_w, ctr_h, side_h = p
+        if gap1 is None:
+            gap1 = gap0                       # gap1 is fixed, not a free parameter
+    elif len(p) == 8:
+        _, div_h, div_w, gap1_p, ctr_w, side_w, ctr_h, side_h = p
+        if gap1 is None:
+            gap1 = gap1_p                     # legacy: gap1 lives in the vector
+    else:
+        raise ValueError(f"toaster_spec expects a 7- or 8-vector, got {len(p)}")
+    gap1 = float(gap1)
     if cavity_w is None:
         cavity_w = ctr_w + 2.0 * gap0 + 2.0 * div_w + 4.0 * gap1 + 2.0 * side_w
 
@@ -505,37 +428,5 @@ def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010,
         kw["metal_material"] = metal_material
     return cv.CavitySpec(
         outer=cv.Rect.from_center(0.0, 0.0, cavity_w, cavity_h, "cavity"),
-        metal=metal, mesh_size=mesh_size, tag=tag, mesh_uniform=mesh_uniform, **kw)
-
-def rect_spec(width, height, tag="rect", mesh_size=0.001, wall_material=None):
-    """
-    Build a simple rectangular cavity spec with no internal features.
-    """
-    kw = {}
-    if wall_material is not None:
-        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
-    return cv.CavitySpec(
-        outer=cv.Rect.from_center(0.0, 0.0, width, height, "cavity"),
-        metal=[], mesh_size=mesh_size, tag=tag, **kw)
-
-def cyl_spec(radius, tag="cyl", mesh_size=0.001, wall_material=None):
-    """
-    Build a simple cylindrical cavity spec with no internal features.
-    """
-    kw = {}
-    if wall_material is not None:
-        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
-    return cv.CylSpec(
-        center=(0.0, 0.0), radius=radius, metal=[], mesh_size=mesh_size,
-        tag=tag, **kw)
-
-def half_pipe_spec(radius, tag="half pipe", mesh_size=0.001, wall_material=None):
-    """
-    Build a simple half-pipe cavity spec with no internal features.
-    """
-    kw = {}
-    if wall_material is not None:
-        kw["wall_material"] = cv.Material("aluminium", sigma=cv.SIGMA_AL_COMSOL)
-    return cv.HalfPipeSpec(
-        center=(0.0, 0.0), radius=radius, metal=[], mesh_size=mesh_size,
+        metal=metal, mesh_size=mesh_size, mesh_uniform=mesh_uniform,
         tag=tag, **kw)
