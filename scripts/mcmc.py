@@ -519,10 +519,26 @@ class Surrogate:
         return self.trained
 
     # ---- fit ----------------------------------------------------------------
+    def _split_penalty(self, X, y):
+        """Separate PENALTY observations from real ones."""
+        thr = np.log(PENALTY) - 1e-6
+        bad = y >= thr
+        return X[~bad], y[~bad], int(bad.sum())
+
     def fit(self, epochs=SURROGATE_EPOCHS, batch_size=64, verbose=False,
-            progress_every=SURROGATE_PROGRESS_EVERY):
+            progress_every=SURROGATE_PROGRESS_EVERY, exclude_penalty=True):
         """
         Refit from scratch on the replay buffer.
+
+        exclude_penalty : drop observations sitting at log(PENALTY) before fitting.
+            KEEP THIS ON. Penalty points are a cliff in parameter space, not a
+            smooth function of the geometry, and an MSE regressor cannot fit one.
+            Because log(PENALTY) ~ 76 while real geometries are ~70, even a 5%
+            contamination inflates the target std ~4x and the network collapses to
+            predicting the mean -- which shows up as a training RMSE frozen at
+            exactly _ysi, learning nothing. The surrogate only has to RANK feasible
+            candidates; infeasible ones are already screened by
+            proposed_params_within_limits() before a proposal is ever evaluated.
 
         progress_every : print the running TRAINING RMSE every this many epochs,
             converted back to LOG-OBJECTIVE units (the loss is computed on
@@ -535,6 +551,18 @@ class Surrogate:
             return False
         X = np.stack([p for p, _ in self._buf])
         y = np.array([v for _, v in self._buf], dtype=np.float64)
+        n_all = len(y)
+        if exclude_penalty:
+            X, y, n_bad = self._split_penalty(X, y)
+            if verbose and n_bad:
+                print(f"[{_ts()}] [surrogate] dropped {n_bad}/{n_all} PENALTY "
+                      f"observations ({100*n_bad/max(1,n_all):.1f}%) before fitting",
+                      flush=True)
+            if len(y) < self.min_samples:
+                if verbose:
+                    print(f"[{_ts()}] [surrogate] only {len(y)} non-penalty samples "
+                          f"(< {self.min_samples}); skipping this fit", flush=True)
+                return False
         self._Xmu, self._Xsi = X.mean(0), X.std(0) + 1e-8
         self._ymu, self._ysi = float(y.mean()), float(y.std()) + 1e-8
 
@@ -547,8 +575,10 @@ class Surrogate:
 
         epochs = int(epochs)
         if verbose:
-            print(f"[{_ts()}] [surrogate] fitting on {len(self._buf)} samples, "
-                  f"{epochs} epochs (RMSE below is in log-objective units)",
+            print(f"[{_ts()}] [surrogate] fitting on {len(y)} samples "
+                  f"(target sd = {self._ysi:.4f}), {epochs} epochs. RMSE below is "
+                  f"in log-objective units; a value stuck at the target sd means "
+                  f"the net is predicting the mean and learning nothing.",
                   flush=True)
         self.net.train()
         first = last = float("nan")
@@ -604,6 +634,11 @@ class Surrogate:
             return None
         X = np.stack(self._hist_X[-n:])
         y = np.asarray(self._hist_y[-n:], dtype=np.float64)
+        # score only the points the model was ever asked to represent
+        X, y, _n_bad = self._split_penalty(X, y)
+        if y.size < 1:
+            return None
+        n = int(y.size)
         rmse = float(np.sqrt(np.mean((self.batch_predict(X) - y) ** 2)))
         self.rmse_log.append((self.n_obs, n, rmse))
         return rmse
@@ -1259,3 +1294,18 @@ def NM_opt(x0, max_iters, tuning_steps=16):
               f"  FOM={float(res.fun):.6g}. Re-run from a different start, or "
               f"clamp the offending parameter and re-refine.", flush=True)
     return res.x
+
+def NM_opt_batch(params, max_iters, tuning_steps=16):
+    xs = []
+    for param in params:
+        xs.append(NM_opt(param, max_iters, tuning_steps=tuning_steps))
+
+    return xs
+
+def check_stability(x0, theta_err=1, length_err=0.05, num_samples=100):
+    # x0: ["angle", "div_h", "div_w", "ctr_w", "side_w", "ctr_h", "side_h"]
+    cavity_width = x0[3] + 60 + 2*x0[4] + 2*x0[2] # fixed
+    rng = np.random.default_rng()
+    stds = length_err * np.ones((8,)) # varying gap1 is equivalent to varying both gap0 and gap1
+    stds[0] = theta_err
+    rand_params = rng.normal(x0, stds, num_samples)

@@ -794,6 +794,6 @@ def run_sweep(spec_fn, positions, n_modes: int = 6, order: int = 2,
 
     if plot_all:
         for i, spec in enumerate(specs):
-            plot_modes_square_magnitude(spec, results[i], save=f"TEMP/TEMP_tuning_{i+1}_pos_mode.png")
+            plot_modes_square_magnitude(spec, results[i], save=f"results/08_11_2026_stability_nominal_tuning_{i+1}_pos_mode.png")
     
     return specs, results

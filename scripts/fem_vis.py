@@ -233,6 +233,40 @@ def plot_modes(spec, result, n=None, save=None, cmap="RdBu_r"):
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return fig
 
+def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
+    """
+    |E|^2 of each mode, annotated with f / C / Q / localisation.
+    """
+    if "fields" not in result:
+        raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
+    m = result["mesh"]
+    nmodes = len(result["fields"]) if n is None else min(n, len(result["fields"]))
+    ncol = min(3, nmodes); nrow = int(np.ceil(nmodes / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 3.4 * nrow),
+                                squeeze=False)
+    nv = m.p.shape[1]
+    for i in range(nmodes):
+        ax = axes[i // ncol][i % ncol]
+        u = result["fields"][i][:nv]          # P2: vertex dofs come first
+        val = np.abs(u) ** 2
+        lim = np.max(val) or 1.0
+        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
+                            cmap=cmap, vmin=0.0, vmax=lim, shading="gouraud")
+        for nm, col in (("wall", "#111111"), ("metal", "#111111")):
+            if nm in m.boundaries:
+                f = m.facets[:, m.boundaries[nm]]
+                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
+        md = result["modes"][i]
+        ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
+                        f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(tp, ax=ax, fraction=0.035)
+    for j in range(nmodes, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle(f"E_z modes: {spec.tag or ''}", y=1.0)
+    if save:
+        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
+    return fig
 
 # ─────────────────────────────────────────────────────────────────────────────
 def _pick_best(result, min_localisation=0.0):
@@ -284,6 +318,66 @@ def plot_best_modes(entries, save=None, cmap="RdBu_r", ncol=4,
         lim = gmax if share_scale else (np.max(np.abs(u)) or 1.0)
         tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, u,
                           cmap=cmap, vmin=-lim, vmax=lim, shading="gouraud")
+        for nm in ("wall", "metal"):
+            if nm in m.boundaries:
+                f = m.facets[:, m.boundaries[nm]]
+                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color="#111111", lw=0.9)
+        md = r["modes"][i]
+        head = (lab + "\n") if lab else ""
+        ax.set_title(f"{head}f={r['freqs'][i]/1e9:.3f} GHz  C={md['C']:.3f}\n"
+                     f"Q={md['Q']:.3g}  loc={md['localisation']:.3f}", fontsize=8)
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(tp, ax=ax, fraction=0.04)
+    for j in range(n, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+
+    fig.suptitle(suptitle or "highest form-factor mode across the tuning range",
+                 y=1.0, fontsize=11)
+    if save:
+        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
+    return fig
+
+def plot_best_modes_magnitude_square(entries, save=None, cmap="RdBu_r", ncol=4,
+                    min_localisation=0.0, suptitle=None, share_scale=False):
+    """
+    Field of the HIGHEST-FORM-FACTOR mode (|E|^2) at every tuning position, one panel per
+    step, so you can watch the operating mode evolve across the scan.
+
+    entries : list of (spec, result) or (spec, result, label). Every result must
+              come from solve_cavity(..., keep_fields=True). Each tuning position
+              has its own geometry and therefore its own mesh, which is why the
+              meshes are drawn per panel rather than reused.
+    min_localisation : forwarded to the mode choice -- set it > 0 to pick the best
+              DELOCALISED mode instead of letting argmax(C) grab a localised one.
+    share_scale : use one colour scale across panels instead of normalising each.
+              Per-panel (default) shows mode shape best; shared shows amplitude loss.
+    """
+    ents = [(e[0], e[1], (e[2] if len(e) > 2 else "")) for e in entries]
+    for _, r, _lab in ents:
+        if "fields" not in r:
+            raise ValueError("a result has no fields: "
+                             "call solve_cavity(..., keep_fields=True)")
+    n = len(ents)
+    ncol = min(ncol, n)
+    nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 3.9 * nrow),
+                             squeeze=False)
+
+    picks = [_pick_best(r, min_localisation) for _, r, _l in ents]
+    gmax = 1.0
+    if share_scale:
+        gmax = max(np.max(np.abs(r["fields"][i][:r["mesh"].p.shape[1]]))
+                   for (_, r, _l), i in zip(ents, picks)) or 1.0
+
+    for k, ((spec, r, lab), i) in enumerate(zip(ents, picks)):
+        ax = axes[k // ncol][k % ncol]
+        m = r["mesh"]
+        nv = m.p.shape[1]
+        u = r["fields"][i][:nv]
+        val = np.abs(u) ** 2
+        lim = gmax if share_scale else (np.max(val) or 1.0)
+        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
+                          cmap=cmap, vmin=0.0, vmax=lim, shading="gouraud")
         for nm in ("wall", "metal"):
             if nm in m.boundaries:
                 f = m.facets[:, m.boundaries[nm]]

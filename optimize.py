@@ -38,12 +38,9 @@ if __name__ == "__main__":
     #rounded_params = np.array([0, 128.69, 4.6586, 10, 6.9514, 6.734, 124.87, 123.77])
     
     n_walkers = 10
-    seeds = generate_seeds(n_walkers)
 
-    print(seeds)
-
-    best_params, best_value, chains_params, chains_values = mcmc.mcmc_minimize(initial_params = seeds, 
-        steps=2500, save_path=PATH, n_walkers=n_walkers, tuning_steps=TUNING_STEPS, proposal_std=0.1, use_surrogate=True 
+    best_params, best_value, chains_params, chains_values = mcmc.continue_mcmc( 
+        steps=1990, save_path=PATH, n_walkers=n_walkers, tuning_steps=TUNING_STEPS, proposal_std=0.1, use_surrogate=True 
     )
     #print(mcmc.fom(np.array([  0., 125.,   5.,  10.,   6.,   6., 125., 125.])))
 
