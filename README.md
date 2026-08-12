@@ -50,10 +50,13 @@ After running 3500 iterations (first stage), we set the side gaps to be $10\ \ma
 
 # Optimization technique
 
-The primary optimization technique used to find the optimal geometry is an MCMC-type Metropolis-Hastings simulated annealing strategy. In typical Metropolis-Hastings for sampling from a distribution $P(x)$, we assume that we have access to a function $f(x)$ which is proportional to $P(x).$ We first choose a (symmetric) proposal function $g(y\mid x)$, and at each step of the walk, the next step $x'$ is chosen by sampling from $g(x'\mid x)$. The acceptance probability is then calculated as $\alpha=\min\left(1,\frac{f(x')}{f(x)}\right)$. The stationary distribution of this can be shown to match up with $P(x)$.
+The primary optimization technique used to find the optimal geometry is an MCMC-type Metropolis-Hastings simulated annealing strategy. In typical Metropolis-Hastings for sampling from a distribution $P(x)$, we assume that we have access to a function $f(x)$ which is proportional to $P(x).$ We first choose a (symmetric) proposal function $g(y\mid x)$, and at each step of the walk, the next step $x'$ is chosen by sampling from $g(x'\mid x)$. The acceptance probability is then calculated as 
+
+$$\alpha=\min\left(1,\frac{f(x')}{f(x)}\right).$$
+
+The stationary distribution of this can be shown to match up with $P(x)$.
 
 When annealing, we apply a similar strategy, except we now have a temperature function $T(n)$, where $n$ is the current step number. The acceptance probability is then calculated as
-
 
 $$\alpha_{\text{anneal}}=\min\left(1,\exp\left(-\frac{f(x')-f(x)}{T(n)}\right)\right).$$
 
