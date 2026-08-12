@@ -54,6 +54,7 @@ The primary optimization technique used to find the optimal geometry is an MCMC-
 
 When annealing, we apply a similar strategy, except we now have a temperature function $T(n)$, where $n$ is the current step number. The acceptance probability is then calculated as
 
+
 $$\alpha_{\text{anneal}}=\min\left(1,\exp\left(-\frac{f(x')-f(x)}{T(n)}\right)\right).$$
 
 Note that this no longer gives a stationary distribution $P(x)$. The rationale now, however, is that at lower temperatures, the walker will naturally find its way toward lower objective values.
@@ -64,7 +65,7 @@ Our proposal function is a $\chi^2$ distribution with 3 degrees of freedom. Our 
 
 An issue with MCMC/annealing is that steps may be "bad" in the sense that they don't walk towards lower objective values. One fix is to use a surrogate function which is supposed to approximate the objective sufficiently well. Our surrogate was a multi-layer perceptron (MLP) trained on the log-objective values *only on the buffer*. That is, if we have run 250 iterations, then the surrogate only sees the previous 250 iterations. This was done because we frequently restricted the parameter space. 
 
-For a given set of parameters $x$, the surrogate would only train on $(x, f(x))$ if the minimum form factor $C_\text{min}(x)$ along the tuning range in the calculation of $f(x)$ satisfied $C_\text{min(x)}\geq0.05.$ This was done because we set a penalty of $1e+33$ whenever $C_\text{min(x)}<0.05$ to discount low-form factor geometries that would also yield relatively low figures of merit. 
+For a given set of parameters $x$, the surrogate would only train on $(x, f(x))$ if the minimum form factor $C_\text{min}(x)$ along the tuning range in the calculation of $f(x)$ satisfied $C_\text{min(x)}\geq0.05.$ This was done because we set a penalty of 1e+33 whenever $C_\text{min(x)}<0.05$ to discount low-form factor geometries that would also yield relatively low figures of merit. 
 
 The MLP was first trained after 100 initial iterations (1000 individual evaluations across 10 walkers); subsequently, the MLP was trained after every 50 iterations (500 evaluations across 10 walkers). (At times, we would prematurely stop/restart the MCMC, and at each restart, we would retrain the MLP, so the interval between each retraining could have been less than 50 iterations.) 
 
@@ -80,13 +81,15 @@ and
 
 $$\tilde{y}_i=\frac{y_i-\mu_y}{\sigma_{y}+\varepsilon}$$
 
-with $\varepsilon=1e-8$. We used 4 fully-connected layers with $(\tilde{x}_i,\tilde{y}_i)$:
+with $\varepsilon=$1e-8. We used 4 fully-connected layers with $(\tilde{x}_i,\tilde{y}_i)$:
 
 $$\tilde{x}\xrightarrow{\text{layer 1}}\varphi(W_1\tilde{x}+b_1)=h_1\xrightarrow{\text{layer 2}}\varphi(W_2h_1+b_2)=h_2\xrightarrow{\text{layer 3}}\varphi(W_3h_2+b_3)=h_3\xrightarrow{\text{layer 4}}W_4^Th_3+b_3=\tilde{y}$$
 
 with $W_1\in\mathbb{R}^{128\times 7}$ or $\mathbb{R}^{128\times 8}$, $W_2\in\mathbb{R}^{128\times128}$, $W_3\in\mathbb{R}^{64\times128}$, $W_4\in\mathbb{R}^{64}$. Activation is SiLU:
 
-$$\varphi(x)=\frac{x}{1+e^{-x}}.$$ We use the Adam update rule. 
+$$\varphi(x)=\frac{x}{1+e^{-x}}.$$ 
+
+We use the Adam update rule. 
 
 ## Efficacy of the MLP
 
