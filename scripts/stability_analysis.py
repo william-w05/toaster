@@ -274,6 +274,18 @@ def check_stability(x0_mm, num_samples=100, tol: Tolerances | None = None,
 
     Returns (nominal_result, samples, summary).
     """
+
+    def _parse_g(g: dict):
+        st = ""
+        for i, k in enumerate(list(g.keys())):
+            if i != len(g)-1:
+                st += f"{k}={g[k]}, "
+            elif i == int(len(g)//2):
+                st += f"{k}={g[k]},\n"
+            else:
+                st += f"{k}={g[k]}"
+        return st
+
     if tol is None:
         tol = (Tolerances.uniform_length(length_err if length_err is not None else 0.05,
                                          theta_err if theta_err is not None else 1.0)
@@ -292,6 +304,7 @@ def check_stability(x0_mm, num_samples=100, tol: Tolerances | None = None,
     t0 = time.perf_counter()
     nominal = evaluate_geometry(g0, tuning_steps, mesh_size, n_workers)
     if verbose:
+        print(f"[stability] nominal: {_parse_g(g0)}")
         print(f"[stability] nominal: FOM={nominal['fom']:.6g}  "
               f"meanC={nominal['C'].mean():.4f}  meanQ={nominal['Q'].mean():.4g}  "
               f"band {nominal['f'].min()/1e9:.3f}-{nominal['f'].max()/1e9:.3f} GHz "
@@ -307,6 +320,7 @@ def check_stability(x0_mm, num_samples=100, tol: Tolerances | None = None,
         r["geom"] = g
         samples.append(r)
         if verbose:
+            print(f"  [{i+1}/{num_samples}] {_parse_g(g)}")
             print(f"  [{i+1}/{num_samples}] FOM={r['fom']:.4g}  "
                   f"minC={r['C'].min() if r['C'].size else float('nan'):.4f}  "
                   f"gapspread={r['gaps'].max()-r['gaps'].min():.4f} mm", flush=True)

@@ -235,7 +235,7 @@ def plot_modes(spec, result, n=None, save=None, cmap="RdBu_r"):
 
 def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
     """
-    |E|^2 of each mode, annotated with f / C / Q / localisation.
+    |E_z|^2 of each mode, annotated with f / C / Q / localisation.
     """
     if "fields" not in result:
         raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
@@ -340,7 +340,7 @@ def plot_best_modes(entries, save=None, cmap="RdBu_r", ncol=4,
 def plot_best_modes_magnitude_square(entries, save=None, cmap="RdBu_r", ncol=4,
                     min_localisation=0.0, suptitle=None, share_scale=False):
     """
-    Field of the HIGHEST-FORM-FACTOR mode (|E|^2) at every tuning position, one panel per
+    Field of the HIGHEST-FORM-FACTOR mode (|E_z|^2) at every tuning position, one panel per
     step, so you can watch the operating mode evolve across the scan.
 
     entries : list of (spec, result) or (spec, result, label). Every result must

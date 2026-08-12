@@ -40,7 +40,7 @@ if __name__ == "__main__":
     n_walkers = 10
 
     best_params, best_value, chains_params, chains_values = mcmc.continue_mcmc( 
-        steps=1990, save_path=PATH, n_walkers=n_walkers, tuning_steps=TUNING_STEPS, proposal_std=0.1, use_surrogate=True 
+        steps=1690, save_path=PATH, n_walkers=n_walkers, tuning_steps=TUNING_STEPS, proposal_std=0.1, use_surrogate=True 
     )
     #print(mcmc.fom(np.array([  0., 125.,   5.,  10.,   6.,   6., 125., 125.])))
 
