@@ -84,7 +84,7 @@ and
 
 $$\tilde{y}_i=\frac{y_i-\mu_y}{\sigma_{y}+\varepsilon}$$
 
-with $\varepsilon=$1e-8. We used 4 fully-connected layers with $(\tilde{x}_i,\tilde{y}_i)$:
+with $\varepsilon$=1e-8. We used 4 fully-connected layers with $(\tilde{x}_i,\tilde{y}_i)$:
 
 $$\tilde{x}\xrightarrow{\text{layer 1}}\varphi(W_1\tilde{x}+b_1)=h_1\xrightarrow{\text{layer 2}}\varphi(W_2h_1+b_2)=h_2\xrightarrow{\text{layer 3}}\varphi(W_3h_2+b_3)=h_3\xrightarrow{\text{layer 4}}W_4^Th_3+b_3=\tilde{y}$$
 
