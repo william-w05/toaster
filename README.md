@@ -62,7 +62,11 @@ $$\alpha_{\text{anneal}}=\min\left(1,\exp\left(-\frac{f(x')-f(x)}{T(n)}\right)\r
 
 Note that this no longer gives a stationary distribution $P(x)$. The rationale now, however, is that at lower temperatures, the walker will naturally find its way toward lower objective values.
 
-Our proposal function is a $\chi^2$ distribution with 3 degrees of freedom. Our temperature function is $T(n)=0.999^n$ (can both be changed).
+Our proposal function is a $\chi^2$ distribution in log-parameter space with 3 degrees of freedom with symmetric clipping with bounds $\pm 2$. A `proposal_std` variable scales the proposed values to a fixed fraction of the range of each parameter
+
+$$\sigma_i=\mathrm{proposal_std}\cdot\mathrm{range}$$
+
+ (so if $t_3$ denotes the value given by the clipped proposal, then each parameter $x_i$ makes a step $x_{i, n+1}=x_{i,n}+t_3\sigma_i$). Our temperature function is $T(n)=0.999^n$. Both of these are tunable.
 
 ## Surrogate boost
 
@@ -72,7 +76,7 @@ For a given set of parameters $x$, the surrogate would only train on $(x, f(x))$
 
 The MLP was first trained after 100 initial iterations (1000 individual evaluations across 10 walkers); subsequently, the MLP was trained after every 50 iterations (500 evaluations across 10 walkers). (At times, we would prematurely stop/restart the MCMC, and at each restart, we would retrain the MLP, so the interval between each retraining could have been less than 50 iterations.) 
 
-We use the model to *rank feasible points.* At each step, $n=64$ points are proposed by the algorithm by drawing from the proposal distribution $g$ ($\chi^2$ distribution). The MLP predicts the values at each of the $n$ proposed points and chooses the point $\bar{x}$ for which its predicted value is lowest. The objective is then evaluated at $\bar{x}$, and the annealing procedure described above is applied to determine whether or not to accept $\bar{x}$ as the next step in the MCMC.
+We use the model to *rank feasible points.* At each step, $n=64$ points are proposed by the algorithm by drawing from the proposal distribution $g$ (clipped $\chi^2$ distribution). The MLP predicts the values at each of the $n$ proposed points and chooses the point $\bar{x}$ for which its predicted value is lowest. The objective is then evaluated at $\bar{x}$, and the annealing procedure described above is applied to determine whether or not to accept $\bar{x}$ as the next step in the MCMC.
 
 ### MLP architecture
 
@@ -88,12 +92,24 @@ with $\varepsilon$=1e-8. We used 4 fully-connected layers with $(\tilde{x}_i,\ti
 
 $$\tilde{x}\xrightarrow{\text{layer 1}}\varphi(W_1\tilde{x}+b_1)=h_1\xrightarrow{\text{layer 2}}\varphi(W_2h_1+b_2)=h_2\xrightarrow{\text{layer 3}}\varphi(W_3h_2+b_3)=h_3\xrightarrow{\text{layer 4}}W_4^Th_3+b_3=\tilde{y}$$
 
-with $W_1\in\mathbb{R}^{128\times 7}$ or $\mathbb{R}^{128\times 8}$, $W_2\in\mathbb{R}^{128\times128}$, $W_3\in\mathbb{R}^{64\times128}$, $W_4\in\mathbb{R}^{64}$. Activation is SiLU:
+with $W_1\in\mathbb{R}^{128\times 7}$ or $\mathbb{R}^{128\times 8}$, $W_2\in\mathbb{R}^{128\times128}$, $W_3\in\mathbb{R}^{64\times128}$, $W_4\in\mathbb{R}^{64}$. Activation is (coordinate-wise) SiLU:
 
 $$\varphi(x)=\frac{x}{1+e^{-x}}.$$ 
 
 We use the Adam update rule. 
 
+## Noisy objective
+
+The script also can optimize the figure of merit accounting for error during the engineering process by treating the optimization goal as a noisy version of the original figure of merit. That is, if $\mathcal{X}$ denotes the parameter space, then the original optimization objective was
+
+$$\min_{x\in\mathcal{X}}f(x)$$
+
+while the new optimization objective is now
+
+$$\min_{\mu\in\mathcal{X}, \delta\sim\mathcal{N}(0,\Sigma)}\mathbb{E}[f(\mu+\delta)].$$
+
+Note that the space in which $\delta$ lives has much higher dimension than $\mathcal{X}$, because we can perturb many more parameters than in the ideal case. We use the mean of $N=40$ points sampled from a multivariate Gaussian as an estimator for $\mathbb{E}[f(x+\delta)]$. Once sampled, these points are fixed relative to where $\mu$ is (since Metropolis-Hastings and the surrogate both require a deterministic objective). With this new objective, everything else (surrogate-boosted annealing, Nelder-Mead) is the same. 
+
 ## Efficacy of the MLP
 
-(WIP) During stage 2 of the optimization procedure, we computed the standard deviation of the log-objective (not including the points where the minimal form factor was less than 0.05) to be approximately 0.26. At the same time, at the 149th iteration and every 50th iteration after that, we computed the RMSE of the MLP on the 49 iterations not used in training the MLP up to that point (This RMSE should be read as an indicator of how well the MLP knows where it wants to go.) The RMSE was initially ~0.5 but dropped to ~0.14 after several hundred iterations. Since the MLP was trained on the (R)MSE of the z-scores of the observations within the training buffer, the "test set" RMSE of approximately 0.14 (less than 0.26) suggests that the MLP is somewhat better than just predicting the mean (i.e. better than random), at least along the parameters for which it chooses to guide the MCMC along.
+(WIP) During stage 2 of the optimization procedure, we compute the intermediate RMSE and Spearman $\rho$ and Kendall $\tau$ coefficients to determine how well the surrogate 1) knows where it's guiding each walker, and 2) can effectively rank different parameters.

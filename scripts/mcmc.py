@@ -63,7 +63,7 @@ N_PARAMS    = 7
 I_ANGLE, I_DIVH, I_DIVW, I_CTRW, I_SIDEW, I_CTRH, I_SIDEH = range(N_PARAMS)
 
 # ── bounds (MILLIMETERS / degrees) ──────────────────────────────────────────
-ANGLE_MIN, ANGLE_MAX   = 0.0, 20.0     # was [0, 70]
+ANGLE_MIN, ANGLE_MAX   = 0.0, 50.0     # was [0, 70]
 H_MIN, H_MAX           = 90.0, 145.0   # ALL heights: div_h, ctr_h, side_h
 H_TOL                  = 0.2           # div_h, side_h within +/-20% of ctr_h
 CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
@@ -343,15 +343,96 @@ def proposed_params_within_limits(proposal):
 # proposals / walker init
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0):
-    """n heavy-tailed Student-t proposals in log-space."""
+# ── proposal geometry ────────────────────────────────────────────────────────
+# "log"  : x' = x * exp(eps)  -- a MULTIPLICATIVE step, i.e. a fixed FRACTION of
+#          the current value.
+# "linear": x' = x + eps      -- an ADDITIVE step of fixed absolute size.
+#
+# Multiplicative was the right default when the box spanned decades. With the
+# current bounds it is not:
+#   * the absolute step scales with the value, so at proposal_std = 0.1 the angle
+#     moves by 1e-4 deg near zero and 2 deg near 20 -- a factor of 2e4 across its
+#     own range (the heights, spanning only 1.6x, barely notice);
+#   * ANGLE_MIN is now 0, and a log-space walk on a parameter whose lower bound is
+#     zero is unbounded BELOW. Simulated walkers drift to ~1e-3 deg and cannot
+#     climb back: escaping to 20 deg needs ~50 consecutive same-sign steps. Since
+#     low angle is the good branch, walkers migrate there and then stop exploring.
+#   * an additive step is symmetric in the parameter itself, so the Metropolis
+#     ratio needs no Jacobian. The multiplicative version is symmetric only in log
+#     space and formally requires an x'/x correction that is not applied. For an
+#     annealer this biases exploration rather than breaking anything, but the
+#     additive form removes the issue.
+# "linear" is therefore the default. Set PROPOSAL_MODE = "log" to restore the old
+# behaviour; proposal_std is then read as a fraction rather than an absolute step.
+PROPOSAL_MODE = "linear"
+
+
+def param_ranges():
+    """(lo, hi) box width per design parameter, for scaling additive steps."""
+    return np.array([ANGLE_MAX - ANGLE_MIN,          # angle
+                     H_MAX - H_MIN,                  # div_h
+                     GAP0 - DIV_W_MIN,               # div_w
+                     CTR_W_MAX - CTR_W_MIN,          # ctr_w
+                     SIDE_W_MAX - SIDE_W_MIN,        # side_w
+                     H_MAX - H_MIN,                  # ctr_h
+                     H_MAX - H_MIN], dtype=np.float64)   # side_h
+
+
+def range_step(frac=0.05):
+    """
+    Per-parameter additive step: `frac` of each parameter's own range. This makes
+    proposal_std mean the same thing for every parameter, which a single scalar
+    fraction of the VALUE does not.
+    """
+    return float(frac) * param_ranges()
+
+
+def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0,
+                     mode=None, params=None):
+    """
+    n heavy-tailed (Student-t, df=3) proposals.
+
+    Called as _batch_proposals(_safe_log(x), std): the first argument is LOG
+    parameters for backward compatibility. In "linear" mode it is exponentiated
+    back immediately, so callers need not change.
+
+    clip is in units of proposal_std, applied to the standardised step.
+    """
+    mode = PROPOSAL_MODE if mode is None else mode
     d = log_params.shape[0]
     lp = torch.tensor(log_params, dtype=torch.float64, device=_dev)
-    std = torch.tensor(proposal_std, dtype=torch.float64, device=_dev)
+    std = torch.tensor(np.asarray(proposal_std, dtype=np.float64),
+                       dtype=torch.float64, device=_dev)
     z = torch.randn(n, d, device=_dev)
     chi2 = torch.distributions.Chi2(float(df)).sample((n, d)).to(_dev)
-    step = ((z / torch.sqrt(chi2 / df)) * std.unsqueeze(0)).clamp(-clip, clip)
-    return torch.exp(lp.unsqueeze(0) + step).cpu().numpy()
+    t = (z / torch.sqrt(chi2 / df)).clamp(-clip, clip)      # standardised t-step
+
+    if mode == "log":
+        return torch.exp(lp.unsqueeze(0) + t * std.unsqueeze(0)).cpu().numpy()
+    if mode == "linear":
+        x = torch.exp(lp) if params is None else torch.tensor(
+            np.asarray(params, dtype=np.float64), dtype=torch.float64, device=_dev)
+        return (x.unsqueeze(0) + t * std.unsqueeze(0)).cpu().numpy()
+    raise ValueError(f"unknown PROPOSAL_MODE {mode!r}")
+
+
+def _resolve_std(proposal_std, n_p):
+    """
+    Turn `proposal_std` into a per-parameter vector.
+
+    A SCALAR means different things in the two modes, so it is resolved here
+    rather than at the call site:
+      "log"    -> a fraction of the current VALUE, the same number for each.
+      "linear" -> a fraction of each parameter's own RANGE, so one number gives
+                  sensible absolute steps for a 20-degree angle and a 55 mm height
+                  at the same time.
+    Pass an explicit vector to override either.
+    """
+    if np.ndim(proposal_std) > 0:
+        return np.asarray(proposal_std, dtype=np.float64)
+    if PROPOSAL_MODE == "linear" and n_p == N_PARAMS:
+        return range_step(float(proposal_std))
+    return np.full(n_p, float(proposal_std))
 
 
 def _jitter_within_limits(base, init_jitter, max_tries=200):
@@ -394,7 +475,7 @@ _EVALS_HEADER = ["Walker", "Parameters", "Value", "Time", "MinC", "MeanQ",
                  "FreqLo", "FreqHi", "Temp", "AcceptProb", "Accepted"]
 
 
-_RMSE_HEADER = ["Iteration", "NEvals", "NTest", "RMSE"]
+_RMSE_HEADER = ["Iteration", "NEvals", "NTest", "RMSE", "Spearman", "Kendall"]
 
 
 def _ensure_csvs(save_path):
@@ -639,9 +720,63 @@ class Surrogate:
         if y.size < 1:
             return None
         n = int(y.size)
-        rmse = float(np.sqrt(np.mean((self.batch_predict(X) - y) ** 2)))
-        self.rmse_log.append((self.n_obs, n, rmse))
+        pred = self.batch_predict(X)
+        rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+        # Rank correlation on the SAME held-out set, with the SAME model, at the
+        # same moment -- this is what screening actually depends on, and unlike
+        # RMSE it is blind to a constant bias.
+        rho = tau = float("nan")
+        if n >= 3 and not (np.allclose(y, y[0]) or np.allclose(pred, pred[0])):
+            try:
+                from scipy.stats import spearmanr, kendalltau
+                rho = float(spearmanr(pred, y).statistic)
+                tau = float(kendalltau(pred, y).statistic)
+            except Exception:
+                pass
+        self.rmse_log.append((self.n_obs, n, rmse, rho, tau))
         return rmse
+
+    # ---- persistence --------------------------------------------------------
+    def save_checkpoint(self, path):
+        """
+        Save everything needed to REPRODUCE this model exactly: weights, the Adam
+        moment estimates, the normalisation constants, the observation history and
+        the RNG states. Without this the model is unrecoverable -- the weights live
+        only in memory, and both the initialisation and the mini-batch shuffle
+        order are unseeded, so a past model cannot be rebuilt bit-for-bit.
+        """
+        torch.save({
+            "net": self.net.state_dict(),
+            "opt": self.opt.state_dict(),
+            "d": self.d, "min_samples": self.min_samples,
+            "trained": self.trained, "n_trained_on": self.n_trained_on,
+            "Xmu": self._Xmu, "Xsi": self._Xsi,
+            "ymu": self._ymu, "ysi": self._ysi,
+            "hist_X": np.asarray(self._hist_X), "hist_y": np.asarray(self._hist_y),
+            "rmse_log": self.rmse_log, "train_rmse_log": self.train_rmse_log,
+            "torch_rng": torch.get_rng_state(),
+            "numpy_rng": np.random.get_state(),
+        }, path)
+        return path
+
+    @classmethod
+    def load_checkpoint(cls, path, restore_rng=False):
+        """Rebuild a Surrogate saved by save_checkpoint()."""
+        ck = torch.load(path, map_location=_dev, weights_only=False)
+        s = cls(ck["d"], min_samples=ck["min_samples"])
+        s.net.load_state_dict(ck["net"]); s.opt.load_state_dict(ck["opt"])
+        s.trained = ck["trained"]; s.n_trained_on = ck["n_trained_on"]
+        s._Xmu, s._Xsi = ck["Xmu"], ck["Xsi"]
+        s._ymu, s._ysi = ck["ymu"], ck["ysi"]
+        s._hist_X = [np.asarray(r) for r in ck["hist_X"]]
+        s._hist_y = list(ck["hist_y"])
+        s._buf.clear()
+        for p, v in zip(s._hist_X, s._hist_y):
+            s._buf.append((p, float(v)))
+        s.rmse_log = list(ck["rmse_log"]); s.train_rmse_log = list(ck["train_rmse_log"])
+        if restore_rng:
+            torch.set_rng_state(ck["torch_rng"]); np.random.set_state(ck["numpy_rng"])
+        return s
 
     def get_rmses(self):
         return list(self.rmse_log)
@@ -729,14 +864,15 @@ def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
             tstate["rmse_done"] = True
             stats["surrogate_rmse_last"] = round(r, 5)
             if rmse_rows is not None:
-                _, n_used, _ = surrogate.rmse_log[-1]
+                _, n_used, _r, rho, tau = surrogate.rmse_log[-1]
                 # buffered, not written here: committed with the rest of the
                 # iteration so an interrupted iteration leaves no orphan row
                 rmse_rows.append([int(step), int(surrogate.n_obs), int(n_used),
-                                  float(r)])
+                                  float(r), float(rho), float(tau)])
             if log:
                 print(f"[{_ts()}] [surrogate] step {step} | held-out RMSE "
-                      f"(log-objective units) = {r:.4f}", flush=True)
+                      f"= {r:.4f} | Spearman rho = {rho:+.4f} | "
+                      f"Kendall tau = {tau:+.4f}", flush=True)
 
     need_first = (not surrogate.trained) and step >= tstate["min_steps"]
     need_refit = surrogate.trained and since >= retrain_every
@@ -746,6 +882,14 @@ def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
             tstate["last_fit_step"] = step
             tstate["rmse_done"] = False
             stats["surrogate_fits"] += 1
+            ckdir = tstate.get("ckpt_dir")
+            if ckdir:
+                try:
+                    os.makedirs(ckdir, exist_ok=True)
+                    surrogate.save_checkpoint(
+                        os.path.join(ckdir, f"surrogate_step{step:06d}.pt"))
+                except Exception as e:
+                    print(f"[surrogate] checkpoint failed: {e}", flush=True)
 
 
 def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates,
@@ -844,7 +988,8 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
     accepted_per_walker = [0] * n_walkers
     evals_at_start = stats["evaluations"]
     tstate = {"last_fit_step": int(surrogate_last_fit_step),
-              "min_steps": int(surrogate_min_steps), "rmse_done": False}
+              "min_steps": int(surrogate_min_steps), "rmse_done": False,
+              "ckpt_dir": os.path.join(os.path.dirname(rmse_path), "surrogate_ckpt")}
     interrupted = False
 
     pbar = tqdm(range(steps), desc=desc)
@@ -908,6 +1053,8 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
             post["sur"] = "on" if surrogate.ready else "cold"
             if surrogate.rmse_log:
                 post["rmse"] = f"{surrogate.rmse_log[-1][2]:.3f}"
+                if len(surrogate.rmse_log[-1]) > 3:
+                    post["rho"] = f"{surrogate.rmse_log[-1][3]:+.2f}"
         pbar.set_postfix(post); pbar.refresh()
 
         if save_interval and (i % save_interval == 0):
@@ -941,8 +1088,11 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
               f"| final FOM={float(walker_values[w]):.4g}")
     if surrogate is not None and surrogate.rmse_log:
         print("\n  surrogate held-out RMSE (log-objective units):")
-        for n_obs, n_test, r in surrogate.rmse_log:
-            print(f"    after {n_obs:>5} evals | test n={n_test:>3} | RMSE={r:.4f}")
+        for rec in surrogate.rmse_log:
+            n_obs, n_test, r = rec[0], rec[1], rec[2]
+            rho = rec[3] if len(rec) > 3 else float("nan")
+            print(f"    after {n_obs:>5} evals | test n={n_test:>3} | "
+                  f"RMSE={r:.4f} | rho={rho:+.4f}")
         print(f"    -> appended to {rmse_path}")
     return best_params, best_value, chains_params, chains_values
 
@@ -989,9 +1139,7 @@ def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
     all_path, best_path, evals_path, rmse_path, evals_width = _ensure_csvs(save_path)
     walker_params = _init_walker_params(initial_params, n_walkers, init_jitter)
     n_p = walker_params[0].size
-    proposal_std = (np.asarray(proposal_std, dtype=np.float64)
-                    if np.ndim(proposal_std) > 0
-                    else np.full(n_p, float(proposal_std)))
+    proposal_std = _resolve_std(proposal_std, n_p)
 
     surrogate = None
     if use_surrogate:
@@ -1294,18 +1442,3 @@ def NM_opt(x0, max_iters, tuning_steps=16):
               f"  FOM={float(res.fun):.6g}. Re-run from a different start, or "
               f"clamp the offending parameter and re-refine.", flush=True)
     return res.x
-
-def NM_opt_batch(params, max_iters, tuning_steps=16):
-    xs = []
-    for param in params:
-        xs.append(NM_opt(param, max_iters, tuning_steps=tuning_steps))
-
-    return xs
-
-def check_stability(x0, theta_err=1, length_err=0.05, num_samples=100):
-    # x0: ["angle", "div_h", "div_w", "ctr_w", "side_w", "ctr_h", "side_h"]
-    cavity_width = x0[3] + 60 + 2*x0[4] + 2*x0[2] # fixed
-    rng = np.random.default_rng()
-    stds = length_err * np.ones((8,)) # varying gap1 is equivalent to varying both gap0 and gap1
-    stds[0] = theta_err
-    rand_params = rng.normal(x0, stds, num_samples)

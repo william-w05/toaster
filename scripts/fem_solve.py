@@ -61,7 +61,6 @@ from skfem import (Basis, FacetBasis, ElementTriP1, ElementTriP2,
                    BilinearForm, Functional, asm)
 from skfem.helpers import dot, grad
 from scipy.sparse.linalg import eigsh
-import matplotlib.pyplot as plt
 
 # physical constants (SI)
 C0   = 299792458.0
@@ -126,23 +125,42 @@ class Material:
 
 @dataclass
 class Rect:
-    """Axis-aligned rectangle, lower-left corner + size, in METRES."""
+    """
+    Rectangle in METRES, given by its lower-left corner and size, optionally
+    ROTATED about its own centre.
+
+    angle : degrees, counter-clockwise, measured from the un-rotated orientation
+        (so the long axis of a tall bar tilts away from +y). gmsh always builds
+        the rectangle axis-aligned and build_mesh then rotates it about
+        (cx, cy), which is why `as_tuple` still returns the un-rotated corner.
+    """
     x0: float
     y0: float
     w: float
     h: float
     name: str = "rect"
+    angle: float = 0.0
 
     def as_tuple(self):
-        """gmsh occ.addRectangle signature: (x, y, z, dx, dy)."""
+        """gmsh occ.addRectangle signature: (x, y, z, dx, dy) -- UN-rotated."""
         return (self.x0, self.y0, 0.0, self.w, self.h)
+
+    def corners(self):
+        """(4, 2) array of the actual corners, rotation included."""
+        cx, cy = self.cx, self.cy
+        dx, dy = 0.5 * self.w, 0.5 * self.h
+        pts = np.array([[-dx, -dy], [dx, -dy], [dx, dy], [-dx, dy]])
+        if self.angle:
+            t = np.radians(self.angle)
+            R = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+            pts = pts @ R.T
+        return pts + np.array([cx, cy])
 
     # ---- centre-based interface (usually easier to verify by eye) -------------
     @classmethod
-    def from_center(cls, cx, cy, w, h, name="rect"):
-        """Rectangle from its CENTRE and size. Rect.from_center(0, 0, w, h) is
-        centred on the origin, which matches how a symmetric cavity is described."""
-        return cls(cx - 0.5 * w, cy - 0.5 * h, w, h, name)
+    def from_center(cls, cx, cy, w, h, name="rect", angle=0.0):
+        """Rectangle from its CENTRE and size, optionally rotated (degrees CCW)."""
+        return cls(cx - 0.5 * w, cy - 0.5 * h, w, h, name, angle)
 
     @property
     def cx(self):
@@ -158,20 +176,25 @@ class Rect:
 
     @property
     def bounds(self):
-        """(xmin, ymin, xmax, ymax)"""
-        return (self.x0, self.y0, self.x0 + self.w, self.y0 + self.h)
+        """(xmin, ymin, xmax, ymax) of the ROTATED rectangle."""
+        if not self.angle:
+            return (self.x0, self.y0, self.x0 + self.w, self.y0 + self.h)
+        c = self.corners()
+        return (float(c[:, 0].min()), float(c[:, 1].min()),
+                float(c[:, 0].max()), float(c[:, 1].max()))
 
     def moved_to(self, cx, cy):
         """Copy translated so its centre is at (cx, cy) -- handy for tuning sweeps."""
-        return Rect.from_center(cx, cy, self.w, self.h, self.name)
+        return Rect.from_center(cx, cy, self.w, self.h, self.name, self.angle)
 
     def shifted(self, dx=0.0, dy=0.0):
-        return Rect(self.x0 + dx, self.y0 + dy, self.w, self.h, self.name)
+        return Rect(self.x0 + dx, self.y0 + dy, self.w, self.h, self.name,
+                    self.angle)
 
 
-def CRect(cx, cy, w, h, name="rect"):
+def CRect(cx, cy, w, h, name="rect", angle=0.0):
     """Shorthand alias for Rect.from_center(...)."""
-    return Rect.from_center(cx, cy, w, h, name)
+    return Rect.from_center(cx, cy, w, h, name, angle)
 
 
 @dataclass
@@ -256,24 +279,25 @@ class CylSpec:
         R = self.radius
         return (cx - R, cy - R, cx + R, cy + R)
 
+
 @dataclass
 class HalfPipeSpec:
     """
     Half-disk cross-section (an infinite half-cylinder in 2D): the disk of `radius`
     about `center`, cut along the diameter y = cy. Interface-compatible with
     CavitySpec, so solve_cavity / run_batch / plot_mesh take it unchanged.
- 
+
     upper : True keeps y >= cy, False keeps y <= cy (a trough). The flat face is a
         conducting wall either way, so it joins the "wall" boundary group.
- 
+
     Also a clean validation case: with PEC on both the arc and the diameter the
     modes are exactly the sin(m theta) branch of the full disk,
- 
+
         f_mn = c * j_{m,n} / (2 pi R),   m >= 1, and NON-degenerate
- 
+
     -- the cos branch is killed by E_z = 0 on the diameter, which is why CylSpec's
     doublets collapse to single modes here. See halfpipe_analytic().
- 
+
     radius : metres.
     metal / dielectric : optional Rect inclusions, exactly as in CavitySpec.
     """
@@ -289,11 +313,11 @@ class HalfPipeSpec:
     mesh_size_min: float | None = None
     mesh_uniform: bool = False
     tag: str = ""
- 
+
     def add_outer(self, occ):
         """
         Must return a SURFACE tag -- build_mesh does dom = [(2, outer)].
- 
+
         Build the disk, then cut away the unwanted half with an oversized
         rectangle. The cutter extends 1.5R past the disk in x so the shapes
         properly overlap rather than meeting tangentially at a corner, and tags are
@@ -312,7 +336,7 @@ class HalfPipeSpec:
             raise ValueError(f"half-pipe cut produced {len(surfs)} surfaces, "
                              f"expected 1 (radius={R}, center={self.center})")
         return surfs[0]
- 
+
     def on_wall(self, pts):
         """The boundary is the arc PLUS the flat diameter; both are conducting."""
         cx, cy = self.center
@@ -325,13 +349,38 @@ class HalfPipeSpec:
         on_flat = (np.all(np.abs(y - cy) < tol) and
                    np.all(r <= self.radius + tol))
         return bool(on_arc or on_flat)
- 
+
     @property
     def extent(self):
         cx, cy = self.center
         R = self.radius
         return ((cx - R, cy, cx + R, cy + R) if self.upper
                 else (cx - R, cy - R, cx + R, cy))
+
+
+def halfpipe_analytic(radius, sigma=SIGMA_COPPER, m=1, n=1):
+    """
+    Closed-form TM_mn of an empty half-disk with PEC arc and diameter.
+
+        E_z = J_m(k r) sin(m theta),  k = j_{m,n}/R,  m >= 1
+        f   = c j_{m,n} / (2 pi R)
+
+    C needs int_0^j u J_m(u) du, which is not elementary, so it is integrated
+    numerically. C vanishes for EVEN m because int_0^pi sin(m theta) dtheta = 0.
+    """
+    from scipy.special import jn_zeros, jv
+    from scipy.integrate import quad
+    if m < 1:
+        raise ValueError("half-disk modes need m >= 1; m = 0 cannot satisfy "
+                         "E_z = 0 on the diameter")
+    j = float(jn_zeros(m, n)[-1])
+    f = C0 * j / (2.0 * np.pi * radius)
+    ang = (1.0 - (-1.0) ** m) / m                      # int_0^pi sin(m th) dth
+    I = quad(lambda u: u * jv(m, u), 0.0, j)[0]        # int_0^j u J_m(u) du
+    num = (ang * radius**2 / j**2 * I) ** 2
+    den = (np.pi * radius**2 / 2.0) * (np.pi * radius**2 / 4.0 * jv(m + 1, j) ** 2)
+    return {"f": f, "C": float(num / den), "j_mn": j}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # geometry + mesh
@@ -394,7 +443,16 @@ def build_mesh(spec, msh_path: str, verbose: bool = False):
 
         # ---- setminus: cut the metal rectangles out of the cavity -----------
         if spec.metal:
-            tools = [(2, occ.addRectangle(*r.as_tuple())) for r in spec.metal]
+            # gmsh has no rotated-rectangle primitive: build axis-aligned, then
+            # rotate about the rectangle's own centre through the z-axis.
+            tools = []
+            for r in spec.metal:
+                t = occ.addRectangle(*r.as_tuple())
+                ang = float(getattr(r, "angle", 0.0))
+                if ang:
+                    occ.rotate([(2, t)], r.cx, r.cy, 0.0, 0.0, 0.0, 1.0,
+                               np.radians(ang))
+                tools.append((2, t))
             dom, _ = occ.cut(dom, tools, removeObject=True, removeTool=True)
             if not dom:
                 raise ValueError("cut() removed the entire domain: the metal "
@@ -577,7 +635,13 @@ def _observables(mesh, element, basis, u, k0, spec, diel_mats):
     Q = (omega * U / P) if P > 0 else np.inf
 
     return dict(C=float(C), Q=float(Q), area=float(area),
-                A_part=float(A_part), localisation=float(A_part / area) if area else 0.0)
+                A_part=float(A_part),
+                localisation=float(A_part / area) if area else 0.0,
+                # int eps_r |E|^2 dA for the STORED (peak-normalised) field. Needed
+                # to rescale that field to a physical amplitude later: the
+                # eigenproblem is homogeneous, so absolute amplitude is a choice.
+                int_eps_E2=float(den),
+                U_stored=float(0.5 * EPS0 * den))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -733,46 +797,10 @@ def run_batch(specs, n_modes: int = 6, f_target=None,
                       flush=True)
     return results
 
-def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
-    """
-    Duplicate of plot_modes_square magnitude in fem_vis to avoid circular import.
-    """
-    MM = 1000.0
-    if "fields" not in result:
-        raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
-    m = result["mesh"]
-    nmodes = len(result["fields"]) if n is None else min(n, len(result["fields"]))
-    ncol = min(3, nmodes); nrow = int(np.ceil(nmodes / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 3.4 * nrow),
-                                squeeze=False)
-    nv = m.p.shape[1]
-    for i in range(nmodes):
-        ax = axes[i // ncol][i % ncol]
-        u = result["fields"][i][:nv]          # P2: vertex dofs come first
-        val = np.abs(u) ** 2
-        #lim = np.max(val) or 1.0
-        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
-                            cmap=cmap, shading="gouraud")
-        for nm, col in (("wall", "#111111"), ("metal", "#111111")):
-            if nm in m.boundaries:
-                f = m.facets[:, m.boundaries[nm]]
-                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
-        md = result["modes"][i]
-        ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
-                        f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
-        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(tp, ax=ax, fraction=0.035)
-    for j in range(nmodes, nrow * ncol):
-        axes[j // ncol][j % ncol].axis("off")
-    fig.suptitle(f"E_z modes: {spec.tag or ''}", y=1.0)
-    if save:
-        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
-    return fig
-
 
 def run_sweep(spec_fn, positions, n_modes: int = 6, order: int = 2,
               n_workers: int | None = None, timeout: float | None = None,
-              verbose: bool = True, plot_all: bool = False):
+              plot_all: bool = False, verbose: bool = True):
     """
     Parallel tuning sweep -- the usual reason a run feels slow is that the steps
     are done one at a time on one core while the rest of the machine sits idle.
@@ -787,13 +815,102 @@ def run_sweep(spec_fn, positions, n_modes: int = 6, order: int = 2,
     pos = list(positions)
     specs = [spec_fn(dx, dy, i) for i, (dx, dy, _f) in enumerate(pos)]
     guesses = [f for _dx, _dy, f in pos]
-
     results = run_batch(specs, n_modes=n_modes, f_target=guesses, order=order,
                         n_workers=n_workers, timeout=timeout, verbose=verbose,
                         keep_fields=plot_all)
-
-    if plot_all:
-        for i, spec in enumerate(specs):
-            plot_modes_square_magnitude(spec, results[i], save=f"results/08_11_2026_stability_nominal_tuning_{i+1}_pos_mode.png")
-    
     return specs, results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# |E|^2 plotting with a physical amplitude
+# ─────────────────────────────────────────────────────────────────────────────
+
+def field_scale(result, i, normalize="energy", energy=1.0):
+    """
+    Multiplier to turn the STORED eigenvector (normalised to peak |E| = 1) into a
+    field with a chosen physical normalisation. Returns (scale, unit_label).
+
+    An eigenmode's amplitude is arbitrary -- K u = k0^2 M u is homogeneous, so
+    c*u is the same mode. Any absolute |E|^2 therefore requires picking a
+    convention:
+
+      "peak"   : leave it alone, max|E| = 1            -> dimensionless
+      "energy" : (eps0/2) int eps_r |E|^2 dA = `energy` joules per metre of
+                 cavity length (2D fields are per unit length)  -> E in V/m
+      "l2"     : int |E|^2 dA = 1                      -> E in 1/m
+    """
+    md = result["modes"][i]
+    if normalize == "peak":
+        return 1.0, "|E|$^2$ (peak-normalised)"
+    if normalize == "energy":
+        U0 = md.get("U_stored")
+        if not U0 or U0 <= 0:
+            raise ValueError("result lacks U_stored; re-solve with this version "
+                             "of cavity2d, or use normalize='peak'.")
+        return float(np.sqrt(energy / U0)), "|E|$^2$  (V/m)$^2$"
+    if normalize == "l2":
+        d = md.get("int_eps_E2")
+        if not d or d <= 0:
+            raise ValueError("result lacks int_eps_E2; use normalize='peak'.")
+        return float(1.0 / np.sqrt(d)), "|E|$^2$  (1/m$^2$)"
+    raise ValueError("normalize must be 'peak', 'energy' or 'l2'")
+
+
+def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="magma",
+                                normalize="energy", energy=1.0, logscale=False):
+    """
+    |E_z|^2 of each mode, with a colourbar carrying real units.
+
+    normalize : see field_scale(). Default "energy" scales each mode so the stored
+        energy is `energy` joules per metre of cavity length, which puts E in V/m.
+        NOTE each mode is scaled INDEPENDENTLY -- comparing panel to panel compares
+        modes at equal stored energy, not at equal drive.
+    cmap : a SEQUENTIAL map by default. |E|^2 >= 0, so a diverging map like RdBu_r
+        puts its neutral colour in the middle of a one-sided range and reads as if
+        there were negative values.
+    logscale : useful when one mode is strongly localised and the peak swamps
+        everything else.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+    MM = 1000.0
+    if "fields" not in result:
+        raise ValueError("no fields in result: call solve_cavity(..., keep_fields=True)")
+
+    m = result["mesh"]
+    nmodes = len(result["fields"]) if n is None else min(n, len(result["fields"]))
+    ncol = min(3, nmodes)
+    nrow = int(np.ceil(nmodes / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.0 * ncol, 3.4 * nrow),
+                             squeeze=False)
+    nv = m.p.shape[1]
+    for i in range(nmodes):
+        ax = axes[i // ncol][i % ncol]
+        scale, unit = field_scale(result, i, normalize=normalize, energy=energy)
+        val = (scale * result["fields"][i][:nv]) ** 2      # P2: vertex dofs first
+        kw = {}
+        if logscale:
+            pos = val[val > 0]
+            if pos.size:
+                kw["norm"] = LogNorm(vmin=max(pos.min(), val.max() * 1e-6),
+                                     vmax=val.max())
+        tp = ax.tripcolor(m.p[0] * MM, m.p[1] * MM, m.t.T, val,
+                          cmap=cmap, shading="gouraud", **kw)
+        for nm in ("wall", "metal"):
+            if nm in m.boundaries:
+                f = m.facets[:, m.boundaries[nm]]
+                ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color="#111111", lw=1.0)
+        md = result["modes"][i]
+        ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
+                     f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        cb = fig.colorbar(tp, ax=ax, fraction=0.035)
+        cb.set_label(unit, fontsize=8)
+    for j in range(nmodes, nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    fig.suptitle(f"|E_z|$^2$: {spec.tag or ''}"
+                 + ("" if normalize == "peak" else
+                    f"   (each mode at U = {energy:g} J/m)"), y=1.0)
+    if save:
+        fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
+    return fig

@@ -1,6 +1,7 @@
 from scripts import fem_vis as viz
 from scripts import fem_solve as fem
 from scripts import mcmc
+from scripts import noisy_mcmc as nz
 
 import numpy as np
 
@@ -12,4 +13,7 @@ if __name__ == "__main__":
     #viz.plot_mesh(spec, title="Mesh (compare against COMSOL)", save="test_results/test_mesh_comsol.png")
 
     #mcmc.sim_sweep(rounded_params, plot_all=True, mesh_uniform=True)
-    mcmc.sim_sweep([0.16899349, 128.74669068, 5.83007533, 10., 9.41222406,  10.9485037, 123.2129638, 124.9380107], plot_all=True)
+    #mcmc.sim_sweep([0.16899349, 128.74669068, 5.83007533, 10., 9.41222406,  10.9485037, 123.2129638, 124.9380107], plot_all=True)
+    x0 = [0.16899349, 128.74669068, 5.83007533, 10., 9.41222406,  10.9485037, 123.2129638, 124.9380107]
+    nz.plot_samples(x0, cov=nz.default_cov(), n=8, save="TEMP/perturb.png")
+    nz.describe_samples(x0, cov=nz.default_cov(), n=8)
