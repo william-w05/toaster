@@ -64,7 +64,7 @@ Note that this no longer gives a stationary distribution $P(x)$. The rationale n
 
 Our proposal function is a $\chi^2$ distribution in log-parameter space with 3 degrees of freedom with symmetric clipping with bounds $\pm 2$. A `proposal_std` variable scales the proposed values to a fixed fraction of the range of each parameter
 
-$$\sigma_i=\mathrm{proposal\_std}\cdot\mathrm{range}$$
+$$\sigma_i=\mathrm{proposal std}\cdot\mathrm{range}$$
 
  (so if $t_3$ denotes the value given by the clipped proposal, then each parameter $x_i$ makes a step $x_{i, n+1}=x_{i,n}+t_3\sigma_i$). Our temperature function is $T(n)=0.999^n$. Both of these are tunable.
 
