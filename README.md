@@ -106,7 +106,7 @@ $$\min_{x\in\mathcal{X}}f(x)$$
 
 while the new optimization objective is now
 
-$$\min_{\mu\in\mathcal{X}, \delta\sim\mathcal{N}(0,\Sigma)}\mathbb{E}[f(\mu+\delta)].$$
+$$\min_{x\in\mathcal{X}, \delta\sim\mathcal{N}(0,\Sigma)}\mathbb{E}_\delta[f(x+\delta)].$$
 
 Note that the space in which $\delta$ lives has much higher dimension than $\mathcal{X}$, because we can perturb many more parameters than in the ideal case. We use the mean of $N=40$ points sampled from a multivariate Gaussian as an estimator for $\mathbb{E}[f(x+\delta)]$. Once sampled, these points are fixed relative to where $\mu$ is (since Metropolis-Hastings and the surrogate both require a deterministic objective). With this new objective, everything else (surrogate-boosted annealing, Nelder-Mead) is the same. 
 
