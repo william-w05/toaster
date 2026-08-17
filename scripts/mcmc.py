@@ -1415,30 +1415,116 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
 # Nelder-Mead refinement
 # ═════════════════════════════════════════════════════════════════════════════
 
-def NM_opt(x0, max_iters, tuning_steps=16):
+_NM_HEADER = ["Eval", "Iter", "Parameters", "Value", "Time", "WithinLimits",
+              "MinC", "MeanQ", "FreqLo", "FreqHi", "BestSoFar"]
+ 
+ 
+def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
+           csv_name="nm_evals.csv", append=False, log_each=True,
+           return_history=False):
     """
     Local refinement of a single geometry, on the RAW objective -- no constraint
     penalty. Nelder-Mead therefore never sees a plateau of tied PENALTY values and
     keeps full ordering information everywhere it steps.
-
-    The trade: NM will actually evaluate geometries outside the limits, which
-    costs real FEM sweeps, and -- the part that matters -- an infeasible geometry
-    can mesh and solve perfectly well and return an excellent FOM. NM will happily
-    converge onto one. The returned point is checked and a warning printed, but
-    the check is only a report: ALWAYS run proposed_params_within_limits() on the
-    result before treating it as a design.
-
+ 
+    The trade: NM will actually evaluate geometries outside the limits, which costs
+    real FEM sweeps, and -- the part that matters -- an infeasible geometry can mesh
+    and solve perfectly well and return an excellent FOM. NM will happily converge
+    onto one.
+ 
+    EVERY evaluation is written to save_path/csv_name as it happens (flushed per
+    row, so an interrupted run keeps everything up to the interruption). The
+    WithinLimits column is what makes that log worth having: if NM converges to an
+    infeasible point, the CSV still contains the best FEASIBLE geometry it visited,
+    which is usually what you actually want. That point is reported at the end and
+    returned in the history.
+ 
+    Note `Eval` counts objective calls while `Iter` counts NM iterations, which are
+    NOT the same -- a simplex iteration costs one evaluation for a reflection and
+    several for a shrink, so Iter lags Eval and repeats.
+ 
     Feed it an MCMC optimum; do NOT feed its trajectory back into the MCMC or the
     surrogate -- hundreds of near-identical points in one basin distort the
     surrogate fit and add nothing to the chain.
+ 
+    Returns res.x, or (res.x, history) if return_history=True.
     """
-    res = scipy.optimize.minimize(
-        lambda x: fom(x, tuning_steps=tuning_steps), _as_7(x0),
-        method="Nelder-Mead", options={"disp": True, "maxiter": max_iters})
-
-    if not proposed_params_within_limits(res.x):
-        print(f"\n[NM_opt] WARNING: the converged point VIOLATES the limits and is "
-              f"not a buildable geometry:\n  {_fmt_params(res.x)}\n"
-              f"  FOM={float(res.fun):.6g}. Re-run from a different start, or "
-              f"clamp the offending parameter and re-refine.", flush=True)
-    return res.x
+    os.makedirs(save_path, exist_ok=True)
+    path = os.path.join(save_path, csv_name)
+    fresh = append and os.path.exists(path)
+    with open(path, "a" if fresh else "w", newline="") as fh:
+        if not fresh:
+            csv.writer(fh).writerow(_NM_HEADER)
+ 
+    state = {"n": 0, "it": 0, "best": np.inf, "best_x": None,
+             "best_feas": np.inf, "best_feas_x": None, "rows": []}
+ 
+    def objective(x):
+        x = np.asarray(x, dtype=np.float64).ravel()
+        t0 = time.perf_counter()
+        value, details = fom(x, tuning_steps=tuning_steps, return_details=True)
+        elapsed = time.perf_counter() - t0
+        value = float(value)
+        state["n"] += 1
+        feas = bool(proposed_params_within_limits(x))
+        if value < state["best"]:
+            state["best"], state["best_x"] = value, x.copy()
+        if feas and value < state["best_feas"]:
+            state["best_feas"], state["best_feas_x"] = value, x.copy()
+ 
+        C, Q, f = details.get("C"), details.get("Q"), details.get("f")
+        row = [state["n"], state["it"], _fmt_arr(x), value, elapsed, feas,
+               (float(np.min(C)) if np.size(C) else ""),
+               (float(np.mean(Q)) if np.size(Q) else ""),
+               (float(np.min(f)) if np.size(f) else ""),
+               (float(np.max(f)) if np.size(f) else ""),
+               float(state["best"])]
+        state["rows"].append(row)
+        with open(path, "a", newline="") as fh:      # flush per row: interrupt-safe
+            csv.writer(fh).writerow(row)
+        if log_each:
+            print(f"[{_ts()}] NM eval {state['n']:>5} (iter {state['it']:>4}) | "
+                  f"{elapsed:6.1f}s | FOM={value:.6g} | "
+                  f"{'feasible' if feas else 'OUTSIDE LIMITS'} | "
+                  f"best={state['best']:.6g}", flush=True)
+        return value
+ 
+    def callback(xk):
+        state["it"] += 1
+ 
+    try:
+        res = scipy.optimize.minimize(
+            objective, _as_7(x0), method="Nelder-Mead", callback=callback,
+            options={"disp": True, "maxiter": max_iters})
+        x_final, f_final = res.x, float(res.fun)
+    except KeyboardInterrupt:
+        print(f"\n[NM_opt] interrupted after {state['n']} evaluations; "
+              f"{path} holds everything so far.", flush=True)
+        x_final = state["best_x"] if state["best_x"] is not None else _as_7(x0)
+        f_final = state["best"]
+ 
+    print(f"\n[NM_opt] {state['n']} evaluations over {state['it']} iterations "
+          f"-> {path}")
+    print(f"[NM_opt] final point    : FOM={f_final:.6g}  {_fmt_params(x_final)}")
+    if not proposed_params_within_limits(x_final):
+        print(f"[NM_opt] WARNING: the converged point VIOLATES the limits and is "
+              f"not a buildable geometry. Re-run from a different start, or clamp "
+              f"the offending parameter and re-refine.", flush=True)
+        if state["best_feas_x"] is not None:
+            print(f"[NM_opt] best FEASIBLE point visited: "
+                  f"FOM={state['best_feas']:.6g}  "
+                  f"{_fmt_params(state['best_feas_x'])}", flush=True)
+        else:
+            print("[NM_opt] no feasible point was visited at all.", flush=True)
+    elif state["best_feas_x"] is not None and state["best_feas"] < f_final - 1e-12:
+        print(f"[NM_opt] note: a BETTER feasible point was visited earlier: "
+              f"FOM={state['best_feas']:.6g}  "
+              f"{_fmt_params(state['best_feas_x'])}", flush=True)
+ 
+    if return_history:
+        return x_final, {"csv": path, "n_evals": state["n"],
+                         "n_iters": state["it"], "rows": state["rows"],
+                         "best": state["best"], "best_x": state["best_x"],
+                         "best_feasible": state["best_feas"],
+                         "best_feasible_x": state["best_feas_x"]}
+    return x_final

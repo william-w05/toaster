@@ -50,7 +50,7 @@ After running 3500 iterations (first stage), we set the side gaps to be $10\ \ma
 
 # Optimization technique
 
-The primary optimization technique used to find the optimal geometry is an MCMC-type Metropolis-Hastings simulated annealing strategy. In typical Metropolis-Hastings for sampling from a distribution $P(x)$, we assume that we have access to a function $f(x)$ which is proportional to $P(x).$ We first choose a (symmetric) proposal function $g(y\mid x)$, and at each step of the walk, the next step $x'$ is chosen by sampling from $g(x'\mid x)$. The acceptance probability is then calculated as 
+The primary optimization technique used to find the optimal geometry is an MCMC-type Metropolis-Hastings simulated annealing scheme. In typical Metropolis-Hastings for sampling from a distribution $P(x)$, we assume that we have access to a function $f(x)$ which is proportional to $P(x).$ We first choose a (symmetric) proposal function $g(y\mid x)$, and at each step of the walk, the next step $x'$ is chosen by sampling from $g(x'\mid x)$. The acceptance probability is then calculated as 
 
 $$\alpha=\min\left(1,\frac{f(x')}{f(x)}\right).$$
 
@@ -108,7 +108,7 @@ while the new optimization objective is now
 
 $$\min_{x\in\mathcal{X}, \delta\sim\mathcal{N}(0,\Sigma)}\mathbb{E}_\delta[f(x+\delta)].$$
 
-Note that the space in which $\delta$ lives has much higher dimension than $\mathcal{X}$, because we can perturb many more parameters than in the ideal case. We use the mean of $N=40$ points sampled from a multivariate Gaussian as an estimator for $\mathbb{E}[f(x+\delta)]$. Once sampled, these points are fixed relative to where $\mu$ is (since Metropolis-Hastings and the surrogate both require a deterministic objective). With this new objective, everything else (surrogate-boosted annealing, Nelder-Mead) is the same. 
+Note that the space in which $\delta$ lives has much higher dimension than $\mathcal{X}$, because we can perturb many more parameters than in the ideal case. (Thus, the above expression is slightly abusing notation.) We use the mean of $N=40$ points sampled from a multivariate Gaussian as an estimator for $\mathbb{E}[f(x+\delta)]$. Once sampled, these points are fixed relative to where $\mu$ is (since Metropolis-Hastings and the surrogate both require a deterministic objective). With this new objective, everything else (surrogate-boosted annealing, Nelder-Mead) is the same. 
 
 ## Efficacy of the MLP
 
