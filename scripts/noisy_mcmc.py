@@ -185,18 +185,18 @@ def default_cov(sigmas=None, **overrides):
     placement offsets get the looser number. Tilt: 0.1 deg over a ~130 mm bar is
     ~0.23 mm of tip displacement, which is already large next to a 10 mm gap.
     """
-    base = {"angle": 0.30,                                    # deg, stage
-            "div_h": 0.025, "div_w": 0.025, "ctr_w": 0.025,
-            "side_w": 0.025, "ctr_h": 0.025, "side_h": 0.025,
-            "divR_w": 0.025, "divR_h": 0.025,
-            "sideR_w": 0.025, "sideR_h": 0.025,
-            "cav_h": 0.050}
+    base = {"angle": 0.10,                                    # deg, stage
+            "div_h": 0.03, "div_w": 0.03, "ctr_w": 0.03,
+            "side_w": 0.03, "ctr_h": 0.03, "side_h": 0.03,
+            "divR_w": 0.03, "divR_h": 0.03,
+            "sideR_w": 0.03, "sideR_h": 0.03,
+            "cav_h": 0.03}
     for g in GAP_NAMES:
-        base[g] = 0.050
+        base[g] = 0.03
     for t in TILT_NAMES:
         base[t] = 0.10                                        # degrees
     for o in OFFSET_NAMES:
-        base[o] = 0.030
+        base[o] = 0.03
     if sigmas:
         base.update(sigmas)
     base.update(overrides)
@@ -215,7 +215,7 @@ def default_cov(sigmas=None, **overrides):
 _Z_BANK: dict = {}          # (D, n, seed) -> the shared standardised draws
 
 
-def get_z_bank(n, D=D_NOISY, clip=np.inf, seed=0, antithetic=False,
+def get_z_bank(n, D=D_NOISY, clip=3.0, seed=0, antithetic=False,
                match_moments=True, whiten=None):
     """
     The shared standardised draws used by every design point (CRN).
@@ -292,7 +292,7 @@ def get_z_bank(n, D=D_NOISY, clip=np.inf, seed=0, antithetic=False,
     return _Z_BANK[key]
 
 
-def _sample_proposal(params, cov, n=5, clip=np.inf, rng=None, common=True, seed=0,
+def _sample_proposal(params, cov, n=5, clip=3.0, rng=None, common=True, seed=0,
                      antithetic=False, match_moments=True, whiten=None):
     """
     n perturbed EXTENDED parameter vectors around `params`.
@@ -443,9 +443,9 @@ def tuning_positions_ext(x_ext, n=16):
 
 
 def fom_single(x_ext, tuning_steps=16, mesh_size=None, c_cutoff=True,
-               verbose=False, return_details=False):
+               verbose=False, return_details=False, check_limits=True):
     """Nominal FOM of ONE perturbed sample. Same definition as mcmc.fom."""
-    if not within_limits_ext(x_ext):
+    if check_limits and not within_limits_ext(x_ext):
         d = {"C": np.array([]), "Q": np.array([]), "f": np.array([]),
              "V": np.array([]), "loc": np.array([]), "n_failed": 0,
              "n_steps": tuning_steps, "infeasible": True}
@@ -495,7 +495,7 @@ _CFG = {"cov": None, "n": 6, "clip": 3.0, "common": True, "seed": 0,
 def fom_mean(params, tuning_steps=None, c_cutoff=True, mesh_size=None,
              verbose=False, return_details=False,
              cov=None, n=None, clip=None, common=None, seed=None,
-             aggregate=None):
+             aggregate=None, check_limits=True):
     """
     Robust objective: the MEAN nominal FOM over n perturbed samples.
 
@@ -534,7 +534,7 @@ def fom_mean(params, tuning_steps=None, c_cutoff=True, mesh_size=None,
     vals, dets = [], []
     for j, x_ext in enumerate(X):
         v, d = fom_single(x_ext, tuning_steps=tuning_steps, mesh_size=mesh_size,
-                          c_cutoff=c_cutoff, return_details=True)
+                          c_cutoff=c_cutoff, return_details=True, check_limits=check_limits)
         vals.append(float(v)); dets.append(d)
         if verbose:
             print(f"    sample {j+1}/{n}: FOM={v:.4g}"
@@ -582,7 +582,7 @@ def fom_mean(params, tuning_steps=None, c_cutoff=True, mesh_size=None,
 _ORIGINAL_FOM = None
 
 
-def install(cov=None, n=6, clip=np.inf, common=True, seed=0, aggregate="mean",
+def install(cov=None, n=6, clip=3.0, common=True, seed=0, aggregate="mean",
             tuning_steps=16, mesh_size=None, verbose=True):
     """
     Point mcmc.fom at the robust objective. After this, mcmc.mcmc_minimize,

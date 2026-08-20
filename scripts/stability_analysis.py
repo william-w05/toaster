@@ -1,28 +1,41 @@
 """
-Machining-tolerance study for the toaster cavity.
+Manufacturing-tolerance study for the toaster cavity.
 
-WHY THIS MATTERS HERE
-    The nominal geometry is mirror-symmetric, so its six gaps are equal and the
-    cells are degenerate -- that degeneracy is exactly what produces the in-phase,
-    high-C operating mode. Independent machining errors detune the cells relative
-    to one another. Whether that destroys the mode depends on one ratio:
+WHAT CHANGED
+    The perturbation model now lives in ONE place, noisy_mcmc, and this module
+    imports it. Previously the two files described the geometry differently --
+    stability.py had its own five-part model with per-part width/height/position
+    and a separate stage-error model, while noisy_mcmc had the 33-dimensional
+    extended vector. Keeping both would have guaranteed they drifted apart.
+    Everything here is therefore expressed in the SAME 33 dimensions:
 
-        cell detuning  ~  (dgap / gap) * f        [50 um on 10 mm  ->  ~75 MHz]
-        cell coupling  ~  the multiplet spread    [measured ~76 MHz]
+        7 design      angle, div_h, div_w, ctr_w, side_w, ctr_h, side_h
+        6 gaps        gap1L_out, gap1L_in, gap0L, gap0R, gap1R_in, gap1R_out
+        1 cavity      cav_h
+        5 rotations   sideL_theta, divL_theta, ctr_theta, divR_theta, sideR_theta
+        4 right dims  divR_w, divR_h, sideR_w, sideR_h
+       10 offsets     sideL_dx/dy, divL_dx/dy, ctr_dx/dy, divR_dx/dy, sideR_dx/dy
 
-    Measured on a representative geometry these are the SAME SIZE, so 50 um sits
-    right at the crossover between "tolerable" and "the mode localises into the
-    widest cell and C collapses". There is no arguing this one from scale alone.
+NO TUNING-POSITION ERROR
+    The stage/leadscrew model (jitter, backlash, lead error, straightness,
+    once-per-revolution, yaw) has been REMOVED. Every sample now walks the exact
+    nominal trajectory: |x| sweeps 0 -> X_MAX on a clean linspace and the per-part
+    offsets are fixed assembly errors applied identically at every tuning step, so
+    nothing accumulates along the sweep. This matches noisy_mcmc exactly, so the
+    robust objective the optimiser minimises and the tolerance study that audits
+    it now describe the same physical assumptions.
 
-WHAT IS VARIED
-    Every rectangle independently -- both dividers and both side toasts separately,
-    which BREAKS the mirror symmetry and is the whole point. Per rectangle:
-    width, height, x-centre, y-centre. Plus cavity width, cavity height, and the
-    tuning angle. 5*4 + 2 + 1 = 23 independent perturbations.
+    The one residual travel-dependent effect is the ANGLE: the trajectory is
+    dy = |dx| tan(angle), so a perturbed angle tilts the whole path (zero
+    deviation at x = 0, ~47 um at full travel for sigma = 0.3 deg). It is a fixed
+    misalignment, not stage noise. Set default_cov(angle=0.0) to pin it.
 
-NO CHANGES TO fem_solve ARE NEEDED
-    CavitySpec already takes an arbitrary list of Rects, so an asymmetric geometry
-    is expressible as-is. All this module adds is a builder that produces one.
+IID SAMPLING, NOT THE MOMENT-MATCHED BANK
+    noisy_mcmc's z-bank is whitened/moment-matched, which makes the SAMPLE moments
+    exact so that a small n estimates E[F] efficiently. That is the wrong tool
+    here: this module reports a DISTRIBUTION (p5, p95, worst case), and whitened
+    points are no longer independent draws from N(0, Sigma). sample_geometries()
+    therefore draws plain iid samples.
 """
 
 from __future__ import annotations
@@ -30,323 +43,171 @@ from __future__ import annotations
 import os
 import csv
 import time
-from dataclasses import dataclass, asdict, field
 
 import numpy as np
 
+from . import mcmc
+from . import noisy_mcmc as nz
 from . import fem_solve as fem
 
 
-MM = 1e-3
+# the perturbation model is noisy_mcmc's; re-exported for convenience
+NOISY_NAMES = nz.NOISY_NAMES
+D_NOISY = nz.D_NOISY
+GAP_NAMES = nz.GAP_NAMES
+PART_NAMES = nz.PART_NAMES
+default_cov = nz.default_cov
+embed = nz.embed
+split = nz.split
+parts_of = nz.parts_of
 
-# ── defaults matching the MCMC ──────────────────────────────────────────────
-GAP0 = 10.0          # mm
-GAP1 = 10.0
-CAVITY_HEIGHT = 160.0
-X_MAX_FREQ = 8.75
-N_MODES = 8          # a touch more than the MCMC: asymmetry splits the multiplet
-MESH_SIZE = 0.001   # m
-PENALTY = 1e33
-C_FLOOR = 0.05
-
-ALUMINIUM = fem.Material("aluminium", sigma=fem.SIGMA_AL_COMSOL)
-
-# the five metal rectangles, in the order used everywhere below
-PARTS = ("ctr", "divL", "divR", "sideL", "sideR")
+PENALTY = mcmc.PENALTY
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# tolerances
+# sampling
 # ═════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class Tolerances:
+def sample_geometries(x0, cov=None, n=100, seed=None, clip=None):
     """
-    1-sigma machining/assembly errors (standard deviations). LENGTHS IN MILLIMETERS, angle in degrees.
+    n INDEPENDENT perturbed extended vectors around the design point x0.
 
-    Suggested starting points, and why they differ:
+    Deliberately not routed through noisy_mcmc._sample_proposal: that applies
+    common random numbers and whitening, which are right for estimating a mean
+    with few samples and wrong for characterising a distribution. Here every
+    sample is an honest iid draw, so percentiles mean what they say.
 
-      width, height  : the machined dimension of each bar. Good CNC holds
-                       +/-25 um (0.001"), routine work +/-50 um. 0.025 is a
-                       realistic default; 0.05 is conservative.
-      position       : where the bar actually ends up once mounted. This is
-                       usually WORSE than the dimension tolerance and it is the
-                       one that matters most, because it changes the GAPS
-                       directly and the gap sets the frequency. 0.05 mm is
-                       optimistic for a bolted assembly; try 0.1 too.
-      cavity_w/h     : a large machined part, +/-50 um typical.
-      angle_deg      : NOT a machined dimension -- it is the alignment of the
-                       tuning trajectory, set by the stage. 1 deg is very
-                       conservative for a linear/rotary stage; 0.1-0.3 deg is
-                       achievable. Keep 1 deg as a worst case, but note that at
-                       theta = 0 a 1 deg error injects |x|*tan(1 deg) = 0.15 mm
-                       of unwanted vertical motion, which is 3x your length
-                       tolerance -- so at low theta the stage alignment, not the
-                       machining, may dominate.
-
-    Set `correlated_parts=True` to model parts cut from one setup (all five bars
-    share a width error) rather than five independent errors.
+    clip : in units of sigma. None (default) means no truncation -- a tolerance
+        study should not discard the tail outcomes it exists to quantify.
     """
-    width: float = 0.05
-    height: float = 0.05
-    position: float = 0.05
-    cavity_w: float = 0.05
-    cavity_h: float = 0.05
-    angle_deg: float = 1
-    correlated_parts: bool = False
-
-    @classmethod
-    def uniform_length(cls, length_err=0.05, angle_err=1.0, **kw):
-        """One number for every length, as in the original sketch."""
-        return cls(width=length_err, height=length_err, position=length_err,
-                   cavity_w=length_err, cavity_h=length_err,
-                   angle_deg=angle_err, **kw)
+    cov = default_cov() if cov is None else np.asarray(cov, dtype=np.float64)
+    mu = embed(x0)
+    D = mu.size
+    if cov.ndim == 1:
+        cov = np.diag(cov)
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((int(n), D))
+    if clip is not None and np.isfinite(clip):
+        z = np.clip(z, -clip, clip)
+    try:
+        L = np.linalg.cholesky(cov + 1e-18 * np.eye(D))
+    except np.linalg.LinAlgError:
+        w, V = np.linalg.eigh(cov)
+        L = V @ np.diag(np.sqrt(np.maximum(w, 0.0)))
+    return mu[None, :] + z @ L.T
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# geometry: nominal -> perturbed -> CavitySpec
+# evaluating one geometry
 # ═════════════════════════════════════════════════════════════════════════════
 
-def nominal_geometry(x0_mm, gap0=GAP0, gap1=GAP1, cavity_h=CAVITY_HEIGHT):
+def evaluate_geometry(x_ext, tuning_steps=16, mesh_size=None, c_cutoff=True, check_limits=True):
     """
-    7-vector [angle, div_h, div_w, ctr_w, side_w, ctr_h, side_h] (mm)
-    -> the full asymmetric description, with left/right split apart.
+    Full tuning sweep of one perturbed geometry.
 
-    Layout outward from the middle:
-        [ctr_w] [gap0] [div_w] [gap1] [side_w] [gap1] | wall
+    Delegates to noisy_mcmc.fom_single, so the geometry builder, the tuning
+    trajectory and the FOM definition are identical to the ones the optimiser
+    uses -- including the absence of any tuning-position error.
     """
-    x = np.asarray(x0_mm, dtype=np.float64).ravel()
-    if x.size == 8:                       # legacy vector with gap1 inside
-        x = np.delete(x, 3)
-    angle, div_h, div_w, ctr_w, side_w, ctr_h, side_h = [float(v) for v in x]
-
-    x_div = ctr_w / 2 + gap0 + div_w / 2
-    x_side = ctr_w / 2 + gap0 + div_w + gap1 + side_w / 2
-    cav_w = ctr_w + 2 * gap0 + 2 * div_w + 4 * gap1 + 2 * side_w
-
-    g = {"angle": angle, "cav_w": cav_w, "cav_h": cavity_h}
-    for name, w, h, xc in (("ctr",   ctr_w,  ctr_h,  0.0),
-                           ("divL",  div_w,  div_h, -x_div),
-                           ("divR",  div_w,  div_h, +x_div),
-                           ("sideL", side_w, side_h, -x_side),
-                           ("sideR", side_w, side_h, +x_side)):
-        g[f"{name}_w"] = w; g[f"{name}_h"] = h
-        g[f"{name}_x"] = xc; g[f"{name}_y"] = 0.0
-    return g
+    value, details = nz.fom_single(x_ext, tuning_steps=tuning_steps,
+                                   mesh_size=mesh_size, c_cutoff=c_cutoff,
+                                   return_details=True, check_limits=check_limits)
+    d = dict(details)
+    d["fom"] = float(value)
+    d["feasible"] = not d.get("infeasible", False)
+    _, cav_w, cav_h = parts_of(x_ext)
+    d["cav_w"], d["cav_h"] = float(cav_w), float(cav_h)
+    d["gaps"] = np.array([split(x_ext)[1][g] for g in GAP_NAMES])
+    return d
 
 
-def perturb_geometry(g, tol: Tolerances, rng=None):
-    """Draw one Gaussian-perturbed geometry. All 23 dimensions independently."""
-    rng = rng or np.random.default_rng()
-    p = dict(g)
-    p["angle"] += rng.normal(0.0, tol.angle_deg)
-    p["cav_w"] += rng.normal(0.0, tol.cavity_w)
-    p["cav_h"] += rng.normal(0.0, tol.cavity_h)
-
-    # one shared draw per dimension if the parts came off a single setup
-    shared_w = rng.normal(0.0, tol.width)
-    shared_h = rng.normal(0.0, tol.height)
-    for name in PARTS:
-        dw = shared_w if tol.correlated_parts else rng.normal(0.0, tol.width)
-        dh = shared_h if tol.correlated_parts else rng.normal(0.0, tol.height)
-        p[f"{name}_w"] = max(p[f"{name}_w"] + dw, 1e-3)
-        p[f"{name}_h"] = max(p[f"{name}_h"] + dh, 1e-3)
-        p[f"{name}_x"] += rng.normal(0.0, tol.position)
-        p[f"{name}_y"] += rng.normal(0.0, tol.position)
-    return p
-
-
-def geometry_gaps(g):
-    """The six gaps (mm), left to right. The frequency lives in these."""
-    edges = []
-    for name in PARTS:
-        edges.append((g[f"{name}_x"] - g[f"{name}_w"] / 2,
-                      g[f"{name}_x"] + g[f"{name}_w"] / 2, name))
-    edges.sort()
-    gaps, prev = [], -g["cav_w"] / 2
-    for lo, hi, _n in edges:
-        gaps.append(lo - prev); prev = hi
-    gaps.append(g["cav_w"] / 2 - prev)
-    return np.array(gaps)
-
-
-def geom_to_spec(g, toast_dx=0.0, toast_dy=0.0, mesh_size=MESH_SIZE,
-                 tag="", wall_material=ALUMINIUM, metal_material=ALUMINIUM,
-                 mesh_uniform=False):
+def gap_asymmetry(x_ext):
     """
-    Build the CavitySpec. toast_dx/dy are in METRES and move the three TOASTS
-    (ctr, sideL, sideR) together; the dividers stay fixed, as in the real tuner.
+    Sum |left gap - mirrored right gap| over the three pairs. Zero for a
+    mirror-symmetric sample. This is the quantity that matters: the cells are
+    degenerate only while the layout is symmetric, and it is that degeneracy
+    which delocalises the mode and gives a high form factor.
     """
-    metal = []
-    for name in PARTS:
-        moves = name in ("ctr", "sideL", "sideR")
-        cx = g[f"{name}_x"] * MM + (toast_dx if moves else 0.0)
-        cy = g[f"{name}_y"] * MM + (toast_dy if moves else 0.0)
-        metal.append(fem.Rect.from_center(cx, cy, g[f"{name}_w"] * MM,
-                                          g[f"{name}_h"] * MM, name))
-    return fem.CavitySpec(
-        outer=fem.Rect.from_center(0.0, 0.0, g["cav_w"] * MM, g["cav_h"] * MM,
-                                   "cavity"),
-        metal=metal, mesh_size=mesh_size, mesh_uniform=mesh_uniform,
-        wall_material=wall_material, metal_material=metal_material, tag=tag)
-
-
-def geom_valid(g, min_gap=0.5):
-    """Cheap sanity screen: no overlaps, nothing outside the cavity."""
-    if min(geometry_gaps(g)) < min_gap:
-        return False
-    for name in PARTS:
-        if abs(g[f"{name}_y"]) + g[f"{name}_h"] / 2 >= g["cav_h"] / 2:
-            return False
-    return True
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# evaluate one geometry
-# ═════════════════════════════════════════════════════════════════════════════
-
-def tuning_positions(g, n=16, gap0=GAP0, x_max=X_MAX_FREQ):
-    """(dx, dy, f_guess) in METRES / Hz, using this geometry's own angle."""
-    t = np.tan(np.radians(float(g["angle"])))
-    for x in -np.linspace(0.0, x_max * MM, n):
-        yield float(x), float(abs(x) * t), 3e8 / (2.0 * (gap0 * MM + abs(x)))
-
-
-def evaluate_geometry(g, tuning_steps=16, mesh_size=MESH_SIZE, n_workers=None,
-                      timeout=600, c_cutoff=True, min_localisation=0.0):
-    """
-    Full tuning sweep of one (possibly asymmetric) geometry.
-
-    Returns dict with per-step arrays and the scan-time FOM, matching the MCMC's
-    definition:  FOM = integral f^2 / (V^2 C^2 Q) df.
-    """
-    positions = list(tuning_positions(g, n=tuning_steps))
-    specs, results = fem.run_sweep(
-        lambda dx, dy, i: geom_to_spec(g, toast_dx=dx, toast_dy=dy,
-                                       mesh_size=mesh_size,
-                                       tag=f"x={dx*1e3:.2f}mm"),
-        positions, n_modes=N_MODES, n_workers=n_workers, timeout=timeout,
-        verbose=False)
-
-    C, Q, f, V, loc = [], [], [], [], []
-    n_failed = 0
-    for r in results:
-        if not r["ok"] or not r.get("modes"):
-            n_failed += 1; continue
-        m = fem.best_mode(r, min_localisation=min_localisation)
-        if m is None:
-            n_failed += 1; continue
-        C.append(m["C"]); Q.append(m["Q"]); f.append(m["f"])
-        V.append(m["area"]); loc.append(m["localisation"])
-
-    C, Q, f, V, loc = map(np.asarray, (C, Q, f, V, loc))
-    out = {"C": C, "Q": Q, "f": f, "V": V, "loc": loc, "n_failed": n_failed,
-           "gaps": geometry_gaps(g)}
-
-    if f.size < 2 or n_failed or (c_cutoff and C.size and C.min() < C_FLOOR):
-        out["fom"] = PENALTY
-        return out
-    fm, Cm = 0.5*(f[:-1]+f[1:]), 0.5*(C[:-1]+C[1:])
-    Qm, Vm = 0.5*(Q[:-1]+Q[1:]), 0.5*(V[:-1]+V[1:])
-    val = float(np.sum(fm**2 / (Vm**2 * Cm**2 * Qm) * np.abs(np.diff(f))))
-    out["fom"] = val if (np.isfinite(val) and val > 0) else PENALTY
-    return out
+    g = split(x_ext)[1]
+    return float(abs(g["gap1L_out"] - g["gap1R_out"])
+                 + abs(g["gap1L_in"] - g["gap1R_in"])
+                 + abs(g["gap0L"] - g["gap0R"]))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # the study
 # ═════════════════════════════════════════════════════════════════════════════
 
-def check_stability(x0_mm, num_samples=100, tol: Tolerances | None = None,
-                    theta_err=None, length_err=None,
-                    tuning_steps=16, mesh_size=MESH_SIZE, n_workers=None,
-                    gap0=GAP0, gap1=GAP1, cavity_h=CAVITY_HEIGHT,
-                    seed=None, save_path=None, verbose=True):
+def check_stability(x0, n_samples=100, cov=None, tuning_steps=16,
+                    mesh_size=None, seed=None, clip=None,
+                    save_path=None, csv_name="stability.csv", verbose=True, check_limits=True):
     """
-    Monte-Carlo the machining tolerances around a nominal design.
+    Monte-Carlo the 33-dimensional tolerance model around a nominal design.
 
-    x0_mm : the nominal 7-vector [angle, div_h, div_w, ctr_w, side_w, ctr_h, side_h].
-    tol   : a Tolerances instance. For the simple "one sigma for all lengths"
-            behaviour pass theta_err / length_err instead (in degrees / mm).
+    x0 : the nominal DESIGN vector (7 entries, or legacy 8).
+    cov : (33, 33) covariance; default_cov() supplies sensible 1-sigma values and
+        accepts short aliases, e.g. default_cov(gap0=0.02, ctr_theta=0.05).
 
-    Every sample perturbs all 23 dimensions independently -- the two dividers and
-    the two side toasts separately -- so the mirror symmetry is genuinely broken.
-
-    Returns (nominal_result, samples, summary).
+    Returns (nominal, samples, summary).
     """
-
-    def _parse_g(g: dict):
-        st = ""
-        for i, k in enumerate(list(g.keys())):
-            if i != len(g)-1:
-                st += f"{k}={g[k]}, "
-            elif i == int(len(g)//2):
-                st += f"{k}={g[k]},\n"
-            else:
-                st += f"{k}={g[k]}"
-        return st
-
-    if tol is None:
-        tol = (Tolerances.uniform_length(length_err if length_err is not None else 0.05,
-                                         theta_err if theta_err is not None else 1.0)
-               if (theta_err is not None or length_err is not None)
-               else Tolerances())
-    rng = np.random.default_rng(seed)
-    g0 = nominal_geometry(x0_mm, gap0, gap1, cavity_h)
+    cov = default_cov() if cov is None else cov
+    x_nom = embed(x0)
 
     if verbose:
-        print(f"[stability] nominal gaps (mm): "
-              f"{np.round(geometry_gaps(g0), 4)}")
-        print(f"[stability] tolerances: {asdict(tol)}")
-        print(f"[stability] {num_samples} samples x {tuning_steps} tuning steps",
-              flush=True)
+        sd = np.sqrt(np.diag(np.asarray(cov, dtype=np.float64)))
+        live = [(NOISY_NAMES[i], sd[i]) for i in range(len(sd)) if sd[i] > 0]
+        print(f"[stability] {D_NOISY} dimensions, {len(live)} with non-zero sigma")
+        print(f"[stability] {n_samples} iid samples x {tuning_steps} tuning steps "
+              f"= {n_samples*tuning_steps} FEM solves")
+        print(f"[stability] no tuning-position error: every sample walks the exact "
+              f"nominal trajectory", flush=True)
 
     t0 = time.perf_counter()
-    nominal = evaluate_geometry(g0, tuning_steps, mesh_size, n_workers)
+    nominal = evaluate_geometry(x_nom, tuning_steps, mesh_size, c_cutoff=False, check_limits=check_limits)
     if verbose:
-        print(f"[stability] nominal: {_parse_g(g0)}")
         print(f"[stability] nominal: FOM={nominal['fom']:.6g}  "
-              f"meanC={nominal['C'].mean():.4f}  meanQ={nominal['Q'].mean():.4g}  "
-              f"band {nominal['f'].min()/1e9:.3f}-{nominal['f'].max()/1e9:.3f} GHz "
+              f"meanC={nominal['C'].mean() if nominal['C'].size else float('nan'):.4f}  "
               f"({time.perf_counter()-t0:.1f}s)", flush=True)
 
-    samples, n_rejected = [], 0
-    for i in range(num_samples):
-        g = perturb_geometry(g0, tol, rng)
-        if not geom_valid(g):
-            n_rejected += 1
-            continue
-        r = evaluate_geometry(g, tuning_steps, mesh_size, n_workers)
-        r["geom"] = g
-        samples.append(r)
+    X = sample_geometries(x0, cov, n_samples, seed=seed, clip=clip)
+    samples = []
+    for i, x in enumerate(X):
+        d = evaluate_geometry(x, tuning_steps, mesh_size, c_cutoff=False, check_limits=check_limits)
+        d["x_ext"] = x
+        d["asymmetry"] = gap_asymmetry(x)
+        samples.append(d)
         if verbose:
-            print(f"  [{i+1}/{num_samples}] {_parse_g(g)}")
-            print(f"  [{i+1}/{num_samples}] FOM={r['fom']:.4g}  "
-                  f"minC={r['C'].min() if r['C'].size else float('nan'):.4f}  "
-                  f"gapspread={r['gaps'].max()-r['gaps'].min():.4f} mm", flush=True)
+            print(f"  [{i+1}/{n_samples}] FOM={d['fom']:.4g}  "
+                  f"minC={d['C'].min() if d['C'].size else float('nan'):.4f}  "
+                  f"gap asym={d['asymmetry']:.4f} mm"
+                  + ("" if d["feasible"] else "  [infeasible]"), flush=True)
 
-    summary = summarise(nominal, samples, n_rejected, verbose=verbose)
+    summary = summarise(nominal, samples, verbose=verbose)
     if save_path:
-        write_csv(save_path, nominal, samples)
+        write_csv(os.path.join(save_path, csv_name), nominal, samples)
+        if verbose:
+            print(f"[stability] wrote {os.path.join(save_path, csv_name)}")
     return nominal, samples, summary
 
 
-def summarise(nominal, samples, n_rejected=0, verbose=True):
-    """Spread of every quantity, and the failure fraction."""
+def summarise(nominal, samples, verbose=True):
+    """Spread of every quantity, plus the failure fraction."""
     ok = [s for s in samples if s["fom"] < PENALTY]
+    out = {"n_samples": len(samples), "n_penalty": len(samples) - len(ok),
+           "frac_penalty": (len(samples) - len(ok)) / max(1, len(samples)),
+           "n_infeasible": sum(1 for s in samples if not s["feasible"])}
+
     def col(key, red):
         return np.array([red(s[key]) for s in ok if np.size(s[key])])
-    out = {"n_samples": len(samples), "n_rejected_geometry": n_rejected,
-           "n_penalty": len(samples) - len(ok),
-           "frac_penalty": (len(samples) - len(ok)) / max(1, len(samples))}
-    for name, arr, nom in (
-            ("fom",   np.array([s["fom"] for s in ok]),      nominal["fom"]),
-            ("meanC", col("C", np.mean),  nominal["C"].mean()  if nominal["C"].size else np.nan),
-            ("minC",  col("C", np.min),   nominal["C"].min()   if nominal["C"].size else np.nan),
-            ("meanQ", col("Q", np.mean),  nominal["Q"].mean()  if nominal["Q"].size else np.nan),
-            ("fmin",  col("f", np.min),   nominal["f"].min()   if nominal["f"].size else np.nan),
-            ("fmax",  col("f", np.max),   nominal["f"].max()   if nominal["f"].size else np.nan),
-            ("minloc", col("loc", np.min), nominal["loc"].min() if nominal["loc"].size else np.nan)):
+
+    fields = (("fom",   np.array([s["fom"] for s in ok]),  nominal["fom"]),
+              ("meanC", col("C", np.mean), _safe(nominal["C"], np.mean)),
+              ("minC",  col("C", np.min),  _safe(nominal["C"], np.min)),
+              ("meanQ", col("Q", np.mean), _safe(nominal["Q"], np.mean)),
+              ("fmin",  col("f", np.min),  _safe(nominal["f"], np.min)),
+              ("fmax",  col("f", np.max),  _safe(nominal["f"], np.max)),
+              ("asym",  np.array([s["asymmetry"] for s in ok]), 0.0))
+    for name, arr, nom in fields:
         if arr.size == 0:
             continue
         out[name] = {"nominal": float(nom), "mean": float(arr.mean()),
@@ -354,40 +215,105 @@ def summarise(nominal, samples, n_rejected=0, verbose=True):
                      "min": float(arr.min()), "max": float(arr.max()),
                      "p5": float(np.percentile(arr, 5)),
                      "p95": float(np.percentile(arr, 95))}
-        out[name]["rel_std"] = (out[name]["std"] / abs(out[name]["mean"])
-                                if out[name]["mean"] else np.nan)
+        m = out[name]["mean"]
+        out[name]["rel_std"] = out[name]["std"] / abs(m) if m else np.nan
+
     if verbose:
-        print(f"\n[stability] {out['n_samples']} evaluated, "
-              f"{out['n_rejected_geometry']} rejected before solving, "
-              f"{out['n_penalty']} hit the penalty "
-              f"({100*out['frac_penalty']:.1f}%)")
-        print(f"  {'quantity':>8} {'nominal':>12} {'mean':>12} {'std':>11} "
-              f"{'rel std':>9} {'p5':>12} {'p95':>12}")
-        for k in ("fom", "meanC", "minC", "meanQ", "fmin", "fmax", "minloc"):
+        print(f"\n[stability] {out['n_samples']} samples | "
+              f"{out['n_penalty']} hit the penalty ({100*out['frac_penalty']:.1f}%) | "
+              f"{out['n_infeasible']} geometrically infeasible")
+        print(f"  {'quantity':>8} {'nominal':>12} {'mean':>12} {'rel sd':>8} "
+              f"{'p5':>12} {'p95':>12}")
+        for k in ("fom", "meanC", "minC", "meanQ", "fmin", "fmax", "asym"):
             if k not in out:
                 continue
             d = out[k]
             print(f"  {k:>8} {d['nominal']:>12.5g} {d['mean']:>12.5g} "
-                  f"{d['std']:>11.4g} {d['rel_std']:>9.2%} {d['p5']:>12.5g} "
-                  f"{d['p95']:>12.5g}")
+                  f"{d['rel_std']:>7.1%} {d['p5']:>12.5g} {d['p95']:>12.5g}")
+        if "fom" in out and out["fom"]["nominal"] > 0:
+            r = out["fom"]["mean"] / out["fom"]["nominal"]
+            print(f"\n  E[FOM] / FOM(nominal) = {r:.3f}x"
+                  + ("   <- perturbation can only make it worse; the nominal is a"
+                     " maximum" if r > 1.05 else ""))
     return out
 
 
+def _safe(a, red):
+    return float(red(a)) if np.size(a) else float("nan")
+
+
 def write_csv(path, nominal, samples):
-    """One row per sample: the FOM, the summary observables, and every dimension."""
+    """One row per sample: the FOM, the observables, and all 33 dimensions."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    geom_keys = sorted(samples[0]["geom"].keys()) if samples else []
-    hdr = (["sample", "fom", "meanC", "minC", "meanQ", "fmin", "fmax", "minloc",
-            "n_failed", "gap_spread"] + geom_keys)
+    hdr = (["sample", "fom", "feasible", "meanC", "minC", "meanQ", "fmin", "fmax",
+            "n_failed", "cav_w", "cav_h", "asymmetry"]
+           + list(GAP_NAMES) + list(NOISY_NAMES))
     with open(path, "w", newline="") as fh:
-        wtr = csv.writer(fh); wtr.writerow(hdr)
+        w = csv.writer(fh); w.writerow(hdr)
         for i, s in enumerate(samples):
-            C, Q, f, loc = s["C"], s["Q"], s["f"], s["loc"]
-            wtr.writerow([i, s["fom"],
-                          C.mean() if C.size else "", C.min() if C.size else "",
-                          Q.mean() if Q.size else "",
-                          f.min() if f.size else "", f.max() if f.size else "",
-                          loc.min() if loc.size else "",
-                          s["n_failed"], s["gaps"].max() - s["gaps"].min()]
-                         + [s["geom"][k] for k in geom_keys])
+            C, Q, f = s["C"], s["Q"], s["f"]
+            w.writerow([i, s["fom"], s["feasible"],
+                        _safe(C, np.mean), _safe(C, np.min), _safe(Q, np.mean),
+                        _safe(f, np.min), _safe(f, np.max),
+                        s["n_failed"], s["cav_w"], s["cav_h"], s["asymmetry"]]
+                       + list(s["gaps"]) + list(s["x_ext"]))
     return path
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# plotting
+# ═════════════════════════════════════════════════════════════════════════════
+
+def plot_stability(nominal, samples, save=None, dpi=160):
+    """
+    Four panels: the FOM distribution against nominal, form factor, the driver
+    (FOM vs gap asymmetry) and the frequency band.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ok = [s for s in samples if s["fom"] < PENALTY]
+    fom = np.array([s["fom"] for s in ok])
+    asym = np.array([s["asymmetry"] for s in ok])
+    minC = np.array([s["C"].min() for s in ok if s["C"].size])
+    fig, ax = plt.subplots(2, 2, figsize=(10, 7))
+
+    a = ax[0][0]
+    a.hist(np.log10(fom), bins=25, color="#b03a2e", alpha=0.75)
+    a.axvline(np.log10(nominal["fom"]), color="#1f4e79", lw=2, label="nominal")
+    a.axvline(np.log10(fom.mean()), color="k", ls="--", lw=1.4, label="E[FOM]")
+    a.set_xlabel(r"$\log_{10}$ FOM"); a.set_ylabel("count")
+    a.set_title("(a) scan-time distribution", fontsize=9)
+    a.legend(fontsize=7, frameon=False)
+
+    a = ax[0][1]
+    if minC.size:
+        a.hist(minC, bins=25, color="#1f4e79", alpha=0.75)
+        if nominal["C"].size:
+            a.axvline(nominal["C"].min(), color="#b03a2e", lw=2, label="nominal")
+        a.axvline(mcmc.C_FLOOR, color="k", ls=":", lw=1.4, label="C floor")
+        a.legend(fontsize=7, frameon=False)
+    a.set_xlabel("worst-step form factor"); a.set_ylabel("count")
+    a.set_title("(b) form factor over the sweep", fontsize=9)
+
+    a = ax[1][0]
+    a.plot(asym, fom, "o", ms=4, color="#b03a2e", alpha=0.6)
+    a.axhline(nominal["fom"], color="#1f4e79", lw=1.6, label="nominal")
+    a.set_yscale("log"); a.set_xlabel("gap asymmetry (mm)"); a.set_ylabel("FOM")
+    a.set_title("(c) FOM vs left-right asymmetry", fontsize=9)
+    a.legend(fontsize=7, frameon=False); a.grid(alpha=0.25, ls=":")
+
+    a = ax[1][1]
+    lo = np.array([s["f"].min() for s in ok if s["f"].size]) / 1e9
+    hi = np.array([s["f"].max() for s in ok if s["f"].size]) / 1e9
+    a.hist(lo, bins=20, alpha=0.7, color="#1f4e79", label="band low")
+    a.hist(hi, bins=20, alpha=0.7, color="#b03a2e", label="band high")
+    a.set_xlabel("frequency (GHz)"); a.set_ylabel("count")
+    a.set_title("(d) tuning band edges", fontsize=9)
+    a.legend(fontsize=7, frameon=False)
+
+    fig.tight_layout()
+    if save:
+        fig.savefig(save, dpi=dpi, bbox_inches="tight"); plt.close(fig)
+    return fig

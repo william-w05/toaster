@@ -19,6 +19,18 @@ CSV ATOMICITY
     Rows are committed one COMPLETE MCMC iteration at a time. Interrupting
     mid-iteration (some walkers stepped, others not) discards that iteration
     entirely rather than leaving a ragged partial group in fem_evals.csv.
+    This now covers ANY exception, not just Ctrl-C: the iteration is rolled
+    back, everything complete is flushed, and the exception is re-raised.
+
+check_limits
+    Every entry point takes check_limits (default True). With it OFF the
+    proposal screen no longer calls proposed_params_within_limits, so the chain
+    may visit geometries that are not buildable. Two consequences worth knowing:
+      * an infeasible geometry can mesh and solve perfectly well and return an
+        excellent FOM, and the chain will happily converge onto it. Every
+        fem_evals row carries a WithinLimits column so the best FEASIBLE point
+        visited is always recoverable afterwards.
+      * the Surrogate.fit rationale for exclude_penalty changes -- see there.
 """
 
 import os
@@ -65,11 +77,15 @@ I_ANGLE, I_DIVH, I_DIVW, I_CTRW, I_SIDEW, I_CTRH, I_SIDEH = range(N_PARAMS)
 # ── bounds (MILLIMETERS / degrees) ──────────────────────────────────────────
 ANGLE_MIN, ANGLE_MAX   = 0.0, 50.0     # was [0, 70]
 H_MIN, H_MAX           = 90.0, 145.0   # ALL heights: div_h, ctr_h, side_h
-H_TOL                  = 0.2           # div_h, side_h within +/-20% of ctr_h
+H_TOL                  = 0.2           # div_h, side_h within +/-H_TOL of ctr_h
 CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
 SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0     # side width capped at 20 mm
-SIDE_W_TOL             = 0.2           # side_w within +/-20% of ctr_w
+SIDE_W_TOL             = 0.4           # side_w within +/-SIDE_W_TOL of ctr_w
 DIV_W_MIN              = 3.0           # div_w in [3, gap0)
+# NOTE: TOTAL_W_MAX ~ 282.8 mm, but the widest geometry the other bounds allow is
+# 20 + 2*10 + 2*10 + 4*10 + 2*20 = 140 mm, so this test can never fire. Kept as
+# documentation of the physical envelope; it would bind again if the width caps
+# were relaxed.
 TOTAL_W_MAX            = 400.0 / np.sqrt(2.0)
 
 # ── solver settings ─────────────────────────────────────────────────────────
@@ -91,7 +107,8 @@ C_FLOOR  = 0.05          # reject a geometry whose worst-step form factor is bel
 # The schedule is counted in MCMC STEPS, not evaluations: one step is n_walkers
 # evaluations, so with n walkers the first fit sees ~100n evaluations and each
 # refit adds ~50n. Keying on steps keeps the cadence identical however many
-# walkers you run.
+# walkers you run. (Exactly: the baseline evaluations are also observed, so the
+# first fit sees min_steps*n + n = (min_steps + 1)*n points.)
 SURROGATE_MIN_STEPS     = 100    # MCMC steps before the FIRST fit
 SURROGATE_RETRAIN_EVERY = 50     # refit every this many MCMC steps
 SURROGATE_EPOCHS        = 1000   # epochs per fit
@@ -100,6 +117,10 @@ SURROGATE_MIN_SAMPLES   = 20     # hard floor: never fit on fewer points than th
 SURROGATE_HIDDEN        = 128
 SURROGATE_LR            = 3e-4
 SURROGATE_BUFFER        = 20000
+
+# hard stop on the proposal retry loop, so an unrecoverable walker raises a clear
+# error instead of spinning forever
+MAX_BATCH_RETRIES = 1000
 
 _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -149,8 +170,15 @@ def _params_to_m(params_mm):
 
 
 def _safe_log(p):
-    """log for the proposal transform. ANGLE_MIN is 0, so params[0] can approach
-    zero and log(0) = -inf would poison the whole proposal batch."""
+    """
+    log for the proposal transform. ANGLE_MIN is 0, so params[0] can approach
+    zero and log(0) = -inf would poison the whole proposal batch.
+
+    LOSSY BY CONSTRUCTION: any value <= 0 is clamped to 1e-12, so exp(_safe_log(x))
+    does NOT round-trip for non-positive x. Callers in "linear" mode must pass the
+    physical point through _batch_proposals(params=...) rather than relying on the
+    round-trip -- see the note there.
+    """
     return np.log(np.maximum(np.asarray(p, dtype=np.float64), 1e-12))
 
 
@@ -247,6 +275,18 @@ def fom(params_mm, tuning_steps=16, c_cutoff=True, mesh_size=MESH_SIZE,
     (15 -> 8 GHz), so a raw f[1:]-f[:-1] is negative and the integral comes out
     negative -- which the Metropolis test reads as non-physical and rejects every
     single proposal.
+
+    FOUR ROUTES TO PENALTY, only ONE of which c_cutoff controls:
+        1. fewer than 2 usable tuning steps          (unconditional)
+        2. any tuning step failed                    (unconditional)
+        3. min form factor C below C_FLOOR           (c_cutoff only)
+        4. non-finite or non-positive integral       (unconditional)
+    So re-running a penalised point with c_cutoff=False recovers the smooth
+    surface ONLY for route 3; routes 1, 2 and 4 return PENALTY either way.
+
+    NOTE this function does NOT consult proposed_params_within_limits, by design:
+    NM_opt needs the raw objective everywhere so it never sees a plateau of tied
+    PENALTY values. Feasibility is the caller's business.
     """
     d = sim_sweep(params_mm, tuning_steps=tuning_steps, mesh_size=mesh_size,
                   verbose=verbose)
@@ -310,13 +350,13 @@ def proposed_params_within_limits(proposal):
             return False
 
     # CENTRE TOAST HEIGHT also clears the wall at maximum displacement.
-    # With theta <= 20 deg this cap is >= 160 - 20*tan(20) = 152.7 mm, so H_MAX
-    # (145) always binds first and this never actually rejects. Kept because it is
-    # the physical clearance condition and would bind again if ANGLE_MAX rose.
+    # This BINDS: the cap 160 - 20*tan(theta) drops below H_MAX (145) once
+    # tan(theta) > 0.75, i.e. theta > 36.87 deg, reaching 136.2 mm at ANGLE_MAX
+    # = 50. (The old comment claiming it never fires assumed ANGLE_MAX = 20.)
     if ctr_h > CAVITY_HEIGHT - 2 * GAP0 * np.abs(np.tan(np.radians(theta))):
         return False
 
-    # DIVIDER / SIDE HEIGHTS within +/-20% of the centre toast
+    # DIVIDER / SIDE HEIGHTS within +/-H_TOL of the centre toast
     if div_h <= (1 - H_TOL) * ctr_h or div_h >= (1 + H_TOL) * ctr_h:
         return False
     if side_h <= (1 - H_TOL) * ctr_h or side_h >= (1 + H_TOL) * ctr_h:
@@ -333,6 +373,7 @@ def proposed_params_within_limits(proposal):
         return False
 
     # TOTAL WIDTH: ctr_w + 2*gap0 + 2*div_w + 4*gap1 + 2*side_w
+    # (unreachable under the current caps -- see the TOTAL_W_MAX note)
     if (ctr_w + 2 * GAP0 + 2 * div_w + 4 * GAP1 + 2 * side_w) >= TOTAL_W_MAX:
         return False
 
@@ -396,6 +437,14 @@ def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0,
     parameters for backward compatibility. In "linear" mode it is exponentiated
     back immediately, so callers need not change.
 
+    PASS params= IN LINEAR MODE. _safe_log clamps at 1e-12, so a non-positive
+    coordinate does not survive the log/exp round trip: a walker sitting at
+    div_w = -2 would silently generate its whole batch around div_w = 1e-12,
+    with nothing raised and the stored state still reading -2. Unreachable while
+    proposed_params_within_limits is enforced (every length is > 0 there), but
+    live the moment check_limits is turned off. Passing the physical point
+    bypasses the round trip entirely.
+
     clip is in units of proposal_std, applied to the standardised step.
     """
     mode = PROPOSAL_MODE if mode is None else mode
@@ -427,6 +476,11 @@ def _resolve_std(proposal_std, n_p):
                   sensible absolute steps for a 20-degree angle and a 55 mm height
                   at the same time.
     Pass an explicit vector to override either.
+
+    EVERY entry point must go through this. continue_mcmc used to build the
+    vector itself with np.full(n_p, std), which in linear mode reads the scalar
+    as an ABSOLUTE step: proposal_std = 0.1 then meant 0.1 mm rather than 0.1 of
+    each range, a 7x to 55x reduction applied silently on resume.
     """
     if np.ndim(proposal_std) > 0:
         return np.asarray(proposal_std, dtype=np.float64)
@@ -435,17 +489,43 @@ def _resolve_std(proposal_std, n_p):
     return np.full(n_p, float(proposal_std))
 
 
-def _jitter_within_limits(base, init_jitter, max_tries=200):
+def _jitter_within_limits(base, init_jitter, max_tries=200, check_limits=True,
+                          warn=True):
+    """
+    A perturbed copy of `base`, retried until it satisfies the limits.
+
+    The jitter follows PROPOSAL_MODE for the same reason the proposals do: the
+    old log-space-only version multiplied by exp(N(0, j)), which collapses to
+    ~1e-12 for any coordinate at or below zero. With ANGLE_MIN = 0 a start point
+    at angle = 0 produced walkers whose angles were all 1e-12.
+
+    Returns base.copy() if no trial satisfies the limits within max_tries, which
+    makes every walker identical -- warned about loudly, because silently
+    collapsing a 10-walker ensemble to one point is very hard to spot downstream.
+    """
     base = _as_7(base)
-    lp = _safe_log(base)
+    if PROPOSAL_MODE == "linear" and base.size == N_PARAMS:
+        scale = float(init_jitter) * param_ranges()
+        draw = lambda: base + np.random.normal(0.0, scale)          # noqa: E731
+    else:
+        lp = _safe_log(base)
+        draw = lambda: np.exp(lp + np.random.normal(0.0, init_jitter,   # noqa: E731
+                                                    size=base.shape))
     for _ in range(max_tries):
-        trial = np.exp(lp + np.random.normal(0.0, init_jitter, size=base.shape))
-        if proposed_params_within_limits(trial):
+        trial = draw()
+        if not check_limits or proposed_params_within_limits(trial):
             return trial
+    if warn:
+        print(f"[MCMC] WARNING: no feasible jitter of {_fmt_params(base)} in "
+              f"{max_tries} tries; returning the base point UNCHANGED. Walkers "
+              f"seeded this way are identical and the ensemble is not "
+              f"independent. Lower init_jitter or start from a feasible point.",
+              flush=True)
     return base.copy()
 
 
-def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
+def _init_walker_params(initial_params, n_walkers, init_jitter=0.05,
+                        check_limits=True):
     ip = np.asarray(initial_params, dtype=np.float64)
     if ip.ndim == 2:
         if ip.shape[0] != n_walkers:
@@ -456,11 +536,15 @@ def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
         raise ValueError("initial_params must be shape (d,) or (n_walkers, d)")
     ip = _as_7(ip)
     if not proposed_params_within_limits(ip):
-        print("[MCMC] WARNING: initial_params violates the limits.", flush=True)
+        print(f"[MCMC] {'WARNING' if check_limits else 'note'}: initial_params "
+              f"violates the limits"
+              + ("." if check_limits else " (check_limits is off, so this is "
+                                          "allowed)."), flush=True)
     walkers = [ip.copy()]
     for _ in range(1, n_walkers):
-        walkers.append(_jitter_within_limits(ip, init_jitter) if init_jitter > 0
-                       else ip.copy())
+        walkers.append(_jitter_within_limits(ip, init_jitter,
+                                             check_limits=check_limits)
+                       if init_jitter > 0 else ip.copy())
     return walkers
 
 
@@ -470,9 +554,12 @@ def _init_walker_params(initial_params, n_walkers, init_jitter=0.05):
 
 # AcceptProb is the Metropolis acceptance probability for this proposal; Accepted
 # is the outcome of the coin flip. Both are blank for the baseline evaluations,
-# which are not proposals and get no Metropolis test.
+# which are not proposals and get no Metropolis test. WithinLimits records
+# feasibility of the evaluated point -- always True when check_limits is on, and
+# the only way to recover the best BUILDABLE geometry when it is off.
 _EVALS_HEADER = ["Walker", "Parameters", "Value", "Time", "MinC", "MeanQ",
-                 "FreqLo", "FreqHi", "Temp", "AcceptProb", "Accepted"]
+                 "FreqLo", "FreqHi", "Temp", "AcceptProb", "Accepted",
+                 "WithinLimits"]
 
 
 _RMSE_HEADER = ["Iteration", "NEvals", "NTest", "RMSE", "Spearman", "Kendall"]
@@ -499,22 +586,26 @@ def _ensure_csvs(save_path):
         hdr = next(csv.reader(fh), None)
     evals_width = len(hdr) if hdr else len(_EVALS_HEADER)
     if evals_width < len(_EVALS_HEADER):
+        missing = _EVALS_HEADER[evals_width:]
         print(f"[MCMC] note: {evals_path} has {evals_width} columns (older "
-              f"format); AcceptProb/Accepted will not be recorded there. Delete "
+              f"format); {', '.join(missing)} will not be recorded there. Delete "
               f"or rename it to get the full header.", flush=True)
     return all_path, best_path, evals_path, rmse_path, evals_width
 
 
 def _eval_row(w, params, value, elapsed, details, temp,
-              accept_prob=None, accepted=None):
+              accept_prob=None, accepted=None, within_limits=None):
     """Build (do not write) one fem_evals.csv row."""
     C = details["C"]; Q = details["Q"]; f = details["f"]
+    if within_limits is None:
+        within_limits = proposed_params_within_limits(params)
     return [w, _fmt_arr(params), float(value), elapsed,
             (float(C.min()) if C.size else ""), (float(Q.mean()) if Q.size else ""),
             (float(f.min()) if f.size else ""), (float(f.max()) if f.size else ""),
             float(temp),
             ("" if accept_prob is None else float(accept_prob)),
-            ("" if accepted is None else bool(accepted))]
+            ("" if accepted is None else bool(accepted)),
+            bool(within_limits)]
 
 
 def _flush_rows(path, rows, width=None):
@@ -582,7 +673,7 @@ class Surrogate:
         self._Xmu = np.zeros(self.d); self._Xsi = np.ones(self.d)
         self._ymu = 0.0; self._ysi = 1.0
         self.n_trained_on = 0                     # history length at the last fit
-        self.rmse_log = []                        # (n_obs, n_test, holdout rmse)
+        self.rmse_log = []                        # (n_obs, n_test, rmse, rho, tau)
         self.train_rmse_log = []                  # (n_obs, first-epoch, final)
 
     # ---- data ---------------------------------------------------------------
@@ -618,8 +709,18 @@ class Surrogate:
             contamination inflates the target std ~4x and the network collapses to
             predicting the mean -- which shows up as a training RMSE frozen at
             exactly _ysi, learning nothing. The surrogate only has to RANK feasible
-            candidates; infeasible ones are already screened by
-            proposed_params_within_limits() before a proposal is ever evaluated.
+            candidates.
+
+            The cost is that the model has no representation of the cliff and can
+            rank a doomed candidate first, wasting the very sweep screening exists
+            to save. With check_limits ON, geometric infeasibility is screened by
+            proposed_params_within_limits before a proposal is ever evaluated, so
+            the only cliff left is the C < C_FLOOR / solver-failure boundary
+            inside fom. With check_limits OFF, nothing is screened and the model
+            is blind to both. If the penalty rate among proposals climbs, the fix
+            is a separate feasibility classifier trained on the FULL history
+            (penalties as labels, not targets) -- not folding penalties back into
+            this regressor.
 
         progress_every : print the running TRAINING RMSE every this many epochs,
             converted back to LOG-OBJECTIVE units (the loss is computed on
@@ -707,6 +808,11 @@ class Surrogate:
         after the last fit and is genuinely unseen -- a real generalisation
         estimate, not a training score. Returns None if not yet fitted or there
         are not that many unseen points.
+
+        CAVEAT on interpretation: these points are all argmin winners of their
+        own screening batches, and no two of them ever competed against each
+        other. The rank correlation here is therefore a FLOOR on screening
+        quality, measured under heavy range restriction, not an estimate of it.
         """
         if not self.trained:
             return None
@@ -724,7 +830,9 @@ class Surrogate:
         rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
         # Rank correlation on the SAME held-out set, with the SAME model, at the
         # same moment -- this is what screening actually depends on, and unlike
-        # RMSE it is blind to a constant bias.
+        # RMSE it is blind to a constant bias. Note RMSE ~ sigma(y) is NOT
+        # evidence of mean-prediction: at correlation r the best achievable RMSE
+        # is sigma*sqrt(1-r^2), which is within 15% of sigma for r below 0.5.
         rho = tau = float("nan")
         if n >= 3 and not (np.allclose(y, y[0]) or np.allclose(pred, pred[0])):
             try:
@@ -783,10 +891,10 @@ class Surrogate:
 
 
 def _seed_surrogate_from_csv(surrogate, evals_path, n_params=N_PARAMS,
-                             verbose=True):
+                             verbose=True, rows=None):
     """Replay every past evaluation into the surrogate buffer (physical -> log)."""
     n = 0
-    for _w, p, v in _read_rows(evals_path, n_params):
+    for _w, p, v in (rows if rows is not None else _read_rows(evals_path, n_params)):
         if p is None or not np.isfinite(v):
             continue
         surrogate.observe(p, _to_obj(v))
@@ -801,10 +909,14 @@ def _seed_surrogate_from_csv(surrogate, evals_path, n_params=N_PARAMS,
 # MCMC
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _new_stats():
+def _new_stats(check_limits=True):
     return {"proposals": 0, "accepted": 0, "improved": 0, "skipped_noop": 0,
+            "limits_checked": bool(check_limits),
+            # stays at 0 when limits_checked is False -- read the flag first, or
+            # "not checked" is indistinguishable from "checked, none rejected"
             "rejected_limits": 0, "rejected_form_factor": 0, "failed_eval": 0,
             "failed_steps": 0, "evaluations": 0, "discarded_partial_evals": 0,
+            "evaluated_outside_limits": 0,
             "surrogate_screens": 0, "surrogate_fits": 0}
 
 
@@ -815,7 +927,7 @@ def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval",
 
     Does NOT write a CSV row: the acceptance probability is only known after the
     Metropolis test, and rows are committed a whole iteration at a time.
-    Returns (value, details, elapsed).
+    Returns (value, details, elapsed, within_limits).
     """
     if log_each_solve:
         print(f"[{_ts()}] {tag} w{w} | eval START | {_fmt_params(params)}", flush=True)
@@ -829,12 +941,15 @@ def _evaluate(w, params, tuning_steps, stats, log_each_solve, temp, tag="eval",
         stats["failed_steps"] += details["n_failed"]
     if details["C"].size and details["C"].min() < C_FLOOR:
         stats["rejected_form_factor"] += 1
+    feasible = proposed_params_within_limits(params)
+    if not feasible:
+        stats["evaluated_outside_limits"] += 1
     if log_each_solve:
         minC = float(details["C"].min()) if details["C"].size else float("nan")
         print(f"[{_ts()}] {tag} w{w} | eval DONE  | {elapsed:6.1f}s | "
-              f"FOM={float(value):.4g} | minC={minC:.3f} | temp={temp:.4g}",
-              flush=True)
-    return value, details, elapsed
+              f"FOM={float(value):.4g} | minC={minC:.3f} | temp={temp:.4g}"
+              + ("" if feasible else " | OUTSIDE LIMITS"), flush=True)
+    return value, details, elapsed, feasible
 
 
 def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
@@ -846,12 +961,16 @@ def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
     `retrain_every` steps. With n walkers that is n evaluations per step, so the
     model sees ~min_steps*n and then ~retrain_every*n new evaluations per fit.
 
+    The baseline evaluations are observed too but do NOT advance `step`, so at
+    the first fit the buffer holds (min_steps + 1)*n_walkers points and a
+    checkpoint saved at step S carries n_obs = (S + 1)*n_walkers.
+
     Ordering matters: the RMSE is taken on the newest (retrain_every - 1)*n_walkers
     evaluations BEFORE the refit that absorbs them, so every scored point arrived
     after the last fit and is genuinely unseen -- a generalisation estimate, not a
     training score.
 
-    tstate = {"last_fit_step", "rmse_done"}.
+    tstate = {"last_fit_step", "min_steps", "rmse_done", "ckpt_dir"}.
     """
     if surrogate is None:
         return
@@ -894,7 +1013,8 @@ def _maybe_train_surrogate(surrogate, stats, tstate, surrogate_epochs,
 
 def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates,
                  temp, tuning_steps, stats, log_each_solve, stuck_warn_every,
-                 surrogate=None):
+                 surrogate=None, check_limits=True,
+                 max_batch_retries=MAX_BATCH_RETRIES):
     """
     One Metropolis step for walker w (exactly one successful FOM evaluation).
     Returns (params, value, accepted, eval_row) -- the row is handed back rather
@@ -903,17 +1023,31 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
     batch_retries = 0
     while True:
         batch_retries += 1
+        if batch_retries > max_batch_retries:
+            raise RuntimeError(
+                f"walker {w} produced no usable proposal in {max_batch_retries} "
+                f"batches of {n_candidates} at {_fmt_params(current_params)}. "
+                f"Either the walker is stranded outside the feasible region or "
+                f"every evaluation is failing; check the last EVAL ERROR above.")
+
+        # params= is REQUIRED here: _safe_log clamps non-positive coordinates to
+        # 1e-12, so without it a walker holding a negative value would generate
+        # its entire batch around 1e-12 instead. Unreachable with check_limits on,
+        # silent corruption with it off.
         raw = _batch_proposals(_safe_log(current_params), proposal_std,
-                               n=n_candidates)
+                               n=n_candidates, params=current_params)
         stats["proposals"] += n_candidates
 
         noop = np.array([np.allclose(p, current_params, rtol=1e-3, atol=1e-12)
                          for p in raw])
         stats["skipped_noop"] += int(noop.sum())
-        within = np.array([proposed_params_within_limits(p) for p in raw])
-        stats["rejected_limits"] += int((~within & ~noop).sum())
 
-        valid = ~noop & within
+        if check_limits:
+            within = np.array([proposed_params_within_limits(p) for p in raw])
+            stats["rejected_limits"] += int((~within & ~noop).sum())
+            valid = ~noop & within
+        else:
+            valid = ~noop
         if not valid.any():
             if batch_retries % stuck_warn_every == 0:
                 print(f"[{_ts()}] step {i:>4} w{w} | {batch_retries} batches, still "
@@ -930,7 +1064,7 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
             proposal = candidates[np.random.randint(len(candidates))]
 
         try:
-            proposal_value, details, elapsed = _evaluate(
+            proposal_value, details, elapsed, feasible = _evaluate(
                 w, proposal, tuning_steps, stats, log_each_solve, temp,
                 tag=f"step {i:>4}", surrogate=surrogate)
         except KeyboardInterrupt:
@@ -950,7 +1084,8 @@ def _walker_step(w, i, current_params, current_value, proposal_std, n_candidates
 
         accepted = bool(np.random.rand() < accept_prob)
         row = _eval_row(w, proposal, proposal_value, elapsed, details, temp,
-                        accept_prob=accept_prob, accepted=accepted)
+                        accept_prob=accept_prob, accepted=accepted,
+                        within_limits=feasible)
         if log_each_solve:
             print(f"[{_ts()}] step {i:>4} w{w} | p_accept={accept_prob:.4g} | "
                   f"accepted={accepted}", flush=True)
@@ -970,14 +1105,20 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
                 surrogate_epochs=SURROGATE_EPOCHS,
                 surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
                 surrogate_min_steps=SURROGATE_MIN_STEPS,
-                surrogate_last_fit_step=0, surrogate_progress_every=SURROGATE_PROGRESS_EVERY,
-                step_offset=0):
+                surrogate_last_fit_step=0,
+                surrogate_progress_every=SURROGATE_PROGRESS_EVERY,
+                step_offset=0, check_limits=True):
     """
     ATOMIC ITERATIONS. Every walker's CSV rows are buffered until the whole
-    iteration finishes. Ctrl-C part-way through an iteration discards that
-    iteration's rows and rolls the in-memory walker state back to the iteration
-    boundary, so fem_evals.csv never contains a ragged partial group and the
-    files stay consistent with what continue_mcmc will read back.
+    iteration finishes. An interruption part-way through an iteration discards
+    that iteration's rows and rolls the in-memory walker state back to the
+    iteration boundary, so fem_evals.csv never contains a ragged partial group
+    and the files stay consistent with what continue_mcmc will read back.
+
+    This applies to ANY exception, not only Ctrl-C: an unexpected failure rolls
+    back the partial iteration, flushes every COMPLETE one, writes the best-so-far
+    file, and only then re-raises. Losing hours of sweeps to a stray TypeError is
+    not an acceptable failure mode.
     """
     n_walkers = len(walker_params)
     chains_params = [[p.copy()] for p in walker_params]
@@ -991,6 +1132,7 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
               "min_steps": int(surrogate_min_steps), "rmse_done": False,
               "ckpt_dir": os.path.join(os.path.dirname(rmse_path), "surrogate_ckpt")}
     interrupted = False
+    fatal = None
 
     pbar = tqdm(range(steps), desc=desc)
     for i in pbar:
@@ -1008,7 +1150,8 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
                 cur_par, cur_val, accepted, row = _walker_step(
                     w, i, walker_params[w], walker_values[w], proposal_std,
                     n_candidates, temp, tuning_steps, stats, log_each_solve,
-                    stuck_warn_every, surrogate=surrogate)
+                    stuck_warn_every, surrogate=surrogate,
+                    check_limits=check_limits)
                 iter_evals.append(row)
                 walker_params[w], walker_values[w] = cur_par, cur_val
                 if accepted:
@@ -1024,7 +1167,7 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
                                    step=step_offset + i + 1, n_walkers=n_walkers,
                                    log=log_each_solve, rmse_rows=iter_rmse,
                                    progress_every=surrogate_progress_every)
-        except KeyboardInterrupt:
+        except BaseException as exc:                 # noqa: BLE001 -- see docstring
             # roll the iteration back; its rows are never written
             (walker_params, walker_values, best_params, best_value,
              accepted_per_walker) = snap[0], snap[1], snap[2], snap[3], snap[4]
@@ -1033,9 +1176,13 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
             stats["accepted"] = snap[5]
             stats["discarded_partial_evals"] += len(iter_evals)
             interrupted = True
-            print(f"\n[{_ts()}] interrupted during iteration {i}: discarding "
-                  f"{len(iter_evals)}/{n_walkers} partial walker row(s); the CSVs "
-                  f"end at the last COMPLETE iteration.", flush=True)
+            if not isinstance(exc, KeyboardInterrupt):
+                fatal = exc
+                print(f"\n[{_ts()}] {type(exc).__name__} during iteration {i}: "
+                      f"{exc}", flush=True)
+            print(f"[{_ts()}] discarding {len(iter_evals)}/{n_walkers} partial "
+                  f"walker row(s); the CSVs end at the last COMPLETE iteration.",
+                  flush=True)
             break
 
         # ---- the iteration completed: commit it ----------------------------
@@ -1081,6 +1228,10 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
     print("\nMCMC diagnostics:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
+    if not stats.get("limits_checked", True):
+        print("  NOTE: check_limits was OFF -- rejected_limits is 0 because the "
+              "test was never run, not because nothing was rejected. See the "
+              "WithinLimits column of fem_evals.csv.")
     print(f"  acceptance rate (per walker-step): "
           f"{stats['accepted'] / max(1, done * n_walkers):.3f}")
     for w in range(n_walkers):
@@ -1094,6 +1245,9 @@ def _run_chains(walker_params, walker_values, best_params, best_value, temp,
             print(f"    after {n_obs:>5} evals | test n={n_test:>3} | "
                   f"RMSE={r:.4f} | rho={rho:+.4f}")
         print(f"    -> appended to {rmse_path}")
+
+    if fatal is not None:
+        raise fatal
     return best_params, best_value, chains_params, chains_values
 
 
@@ -1105,58 +1259,72 @@ def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
                   surrogate_min_steps=SURROGATE_MIN_STEPS,
                   surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
                   surrogate_epochs=SURROGATE_EPOCHS,
-                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY):
+                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY,
+                  check_limits=True):
     """
     Multi-walker simulated-annealing MCMC minimising the FEM scan-time FOM.
 
     initial_params : (7,) in MILLIMETERS -> walker 0 starts there, others at
-        log-jittered copies; or (n_walkers, 7) to set every start explicitly.
+        jittered copies; or (n_walkers, 7) to set every start explicitly.
         A legacy 8-vector is accepted and its gap1 entry dropped.
+
+    proposal_std : scalar or (7,) vector. A scalar goes through _resolve_std, so
+        in "linear" mode it is a FRACTION OF EACH PARAMETER'S RANGE (0.1 -> 5 deg
+        of angle, 5.5 mm of height, 1.7 mm of width), not an absolute step.
+
+    check_limits : screen proposals with proposed_params_within_limits. Turning it
+        OFF lets the chain visit geometries that are not buildable; those still
+        mesh and solve and can score well, so read the WithinLimits column of
+        fem_evals.csv before trusting the final point.
 
     use_surrogate : train an MLP on the log objective and use it to screen the
         candidate batch, so only the most promising proposal costs a real sweep.
         The schedule counts MCMC STEPS: first fit after `surrogate_min_steps`,
         refit every `surrogate_retrain_every` steps, `surrogate_epochs` epochs
-        each. One step is n_walkers evaluations, so with n walkers the first fit
-        sees ~100n evaluations and each refit adds ~50n. A held-out RMSE on the
-        newest (retrain_every-1)*n_walkers unseen evaluations is reported just
-        before every refit, and the training RMSE is printed every
-        `surrogate_progress_every` epochs so you can watch a fit converge.
+        each. One step is n_walkers evaluations; the baseline evaluations are also
+        observed, so the first fit sees (surrogate_min_steps + 1)*n_walkers
+        points. A held-out RMSE on the newest (retrain_every-1)*n_walkers unseen
+        evaluations is reported just before every refit.
 
         OFF by default: argmin screening is greedy and breaks detailed balance.
         See the Surrogate docstring for what that costs.
 
     Ctrl-C is safe: the run stops at the last COMPLETE iteration and the CSVs are
-    left consistent with it.
-
-    The surrogate held-out RMSE is appended to save_path/surrogate_rmse.csv with
-    columns Iteration, NEvals, NTest, RMSE -- ready to plot directly, and appended
-    to (not overwritten) on resume so the series spans sessions.
+    left consistent with it. So is an unexpected exception -- everything complete
+    is flushed before it propagates.
 
     Returns (best_params, best_value, chains_params, chains_values).
     """
-    stats = _new_stats()
+    stats = _new_stats(check_limits)
     all_path, best_path, evals_path, rmse_path, evals_width = _ensure_csvs(save_path)
-    walker_params = _init_walker_params(initial_params, n_walkers, init_jitter)
+    walker_params = _init_walker_params(initial_params, n_walkers, init_jitter,
+                                        check_limits=check_limits)
     n_p = walker_params[0].size
     proposal_std = _resolve_std(proposal_std, n_p)
+    print(f"[MCMC] proposal sd per parameter: "
+          f"{', '.join(f'{n}={s:.4g}' for n, s in zip(PARAM_NAMES, proposal_std))}",
+          flush=True)
+    if not check_limits:
+        print("[MCMC] check_limits is OFF: proposals are NOT screened against "
+              "proposed_params_within_limits.", flush=True)
 
     surrogate = None
     if use_surrogate:
         surrogate = Surrogate(n_p)
         print(f"[surrogate] ON  | first fit at step {surrogate_min_steps} "
-              f"(~{surrogate_min_steps * n_walkers} evals), refit every "
-              f"{surrogate_retrain_every} steps (~{surrogate_retrain_every*n_walkers} "
+              f"({(surrogate_min_steps + 1) * n_walkers} evals), refit every "
+              f"{surrogate_retrain_every} steps ({surrogate_retrain_every*n_walkers} "
               f"evals), {surrogate_epochs} epochs", flush=True)
 
     # baseline evaluations are not proposals -> AcceptProb/Accepted blank.
     # They are their own complete group, so they commit immediately.
     walker_values, init_rows = [], []
     for w in range(n_walkers):
-        v, det, el = _evaluate(w, walker_params[w], tuning_steps, stats,
-                               log_each_solve, TEMP0, tag="init",
-                               surrogate=surrogate)
-        init_rows.append(_eval_row(w, walker_params[w], v, el, det, TEMP0))
+        v, det, el, feas = _evaluate(w, walker_params[w], tuning_steps, stats,
+                                     log_each_solve, TEMP0, tag="init",
+                                     surrogate=surrogate)
+        init_rows.append(_eval_row(w, walker_params[w], v, el, det, TEMP0,
+                                   within_limits=feas))
         walker_values.append(v)
     _flush_rows(evals_path, init_rows, evals_width)
 
@@ -1175,7 +1343,7 @@ def mcmc_minimize(initial_params, steps=10, proposal_std=0.1, tuning_steps=16,
                        surrogate_min_steps=surrogate_min_steps,
                        surrogate_last_fit_step=0,
                        surrogate_progress_every=surrogate_progress_every,
-                       step_offset=0)
+                       step_offset=0, check_limits=check_limits)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1231,7 +1399,7 @@ def _read_rows(path, n_params=N_PARAMS):
 
 
 def load_mcmc_state(save_path="./csvs/", n_params=N_PARAMS, n_walkers=1,
-                    init_jitter=0.05):
+                    init_jitter=0.05, check_limits=True):
     """
     Rebuild everything needed to resume, from the CSVs written by mcmc_minimize.
 
@@ -1242,16 +1410,17 @@ def load_mcmc_state(save_path="./csvs/", n_params=N_PARAMS, n_walkers=1,
     chain file is missing, plus a count of prior evaluations.
 
     Returns dict: walkers [{params, value}], best_params, best_value,
-    n_steps_done, n_prior_evals, source.
+    n_steps_done, n_prior_evals, eval_rows, source.
     """
     all_path   = os.path.join(save_path, "all_params_all_values.csv")
     best_path  = os.path.join(save_path, "best_params_best_values.csv")
     evals_path = os.path.join(save_path, "fem_evals.csv")
 
+    eval_rows = _read_rows(evals_path, n_params)     # read once, reused below
     chain = _read_rows(all_path, n_params)
     source = "all_params_all_values.csv (chain states)"
     if not chain:
-        chain = _read_rows(evals_path, n_params)
+        chain = eval_rows
         source = "fem_evals.csv (FALLBACK: proposals, not chain states)"
     if not chain:
         raise FileNotFoundError(
@@ -1284,7 +1453,8 @@ def load_mcmc_state(save_path="./csvs/", n_params=N_PARAMS, n_walkers=1,
                             "value": float(v)})
         else:
             walkers.append({"params": _jitter_within_limits(
-                np.asarray(best_params, dtype=np.float64), init_jitter),
+                np.asarray(best_params, dtype=np.float64), init_jitter,
+                check_limits=check_limits),
                 "value": None})          # unknown -> evaluated by continue_mcmc
 
     extra = sorted(set(last_state) - set(range(n_walkers)))
@@ -1296,7 +1466,8 @@ def load_mcmc_state(save_path="./csvs/", n_params=N_PARAMS, n_walkers=1,
             "best_params": np.asarray(best_params, dtype=np.float64),
             "best_value": float(best_value),
             "n_steps_done": int(n_steps_done),
-            "n_prior_evals": int(len(_read_rows(evals_path, n_params))),
+            "n_prior_evals": int(len(eval_rows)),
+            "eval_rows": eval_rows,
             "source": source}
 
 
@@ -1308,13 +1479,17 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
                   surrogate_min_steps=SURROGATE_MIN_STEPS,
                   surrogate_retrain_every=SURROGATE_RETRAIN_EVERY,
                   surrogate_epochs=SURROGATE_EPOCHS,
-                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY):
+                  surrogate_progress_every=SURROGATE_PROGRESS_EVERY,
+                  check_limits=True):
     """
-    Resume a run from its CSVs. See mcmc_minimize for use_surrogate semantics.
+    Resume a run from its CSVs. See mcmc_minimize for use_surrogate, proposal_std
+    and check_limits semantics -- all three are resolved identically here, which
+    they were not before: proposal_std used to bypass _resolve_std and be read as
+    an absolute step on resume.
 
     start_from : "last" -> every walker resumes from its own last chain state
                  "best" -> walker 0 restarts at the global best, the rest at
-                           log-jittered copies of it
+                           jittered copies of it
     start_temp : override the annealing temperature. Otherwise rebuilt from the
                  schedule, TEMP0 * COOLING**n_steps_done (floored at TEMP_MIN),
                  exact here because the cooling is geometric -- an adaptive
@@ -1325,14 +1500,15 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
     `surrogate_min_steps` steps relearning what the last session paid for. The
     refit schedule then continues from the resumed step count.
     """
-    state = load_mcmc_state(save_path, n_params, n_walkers, init_jitter)
+    state = load_mcmc_state(save_path, n_params, n_walkers, init_jitter,
+                            check_limits=check_limits)
     print(f"[resume] source        : {state['source']}", flush=True)
     print(f"[resume] prior steps   : {state['n_steps_done']}  "
           f"({state['n_prior_evals']} prior evaluations)", flush=True)
     print(f"[resume] best so far   : {state['best_value']:.6g}", flush=True)
     print(f"[resume] best params   : {_fmt_params(state['best_params'])}", flush=True)
 
-    stats = _new_stats()
+    stats = _new_stats(check_limits)
     stats["evaluations"] = state["n_prior_evals"]
     all_path, best_path, evals_path, rmse_path, evals_width = _ensure_csvs(save_path)
 
@@ -1340,8 +1516,8 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
         walker_params = [state["best_params"].copy()]
         walker_values = [state["best_value"]]
         for _ in range(1, n_walkers):
-            walker_params.append(_jitter_within_limits(state["best_params"],
-                                                       init_jitter))
+            walker_params.append(_jitter_within_limits(
+                state["best_params"], init_jitter, check_limits=check_limits))
             walker_values.append(None)
     elif start_from == "last":
         walker_params = [wk["params"].copy() for wk in state["walkers"]]
@@ -1353,15 +1529,22 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
     best_value = state["best_value"]
 
     n_p = walker_params[0].size
-    proposal_std = (np.asarray(proposal_std, dtype=np.float64)
-                    if np.ndim(proposal_std) > 0
-                    else np.full(n_p, float(proposal_std)))
+    # THE fix: identical resolution to mcmc_minimize. The old np.full(n_p, std)
+    # read a scalar as an absolute step, shrinking every proposal by 7x-55x.
+    proposal_std = _resolve_std(proposal_std, n_p)
+    print(f"[resume] proposal sd   : "
+          f"{', '.join(f'{n}={s:.4g}' for n, s in zip(PARAM_NAMES, proposal_std))}",
+          flush=True)
+    if not check_limits:
+        print("[resume] check_limits is OFF: proposals are NOT screened against "
+              "proposed_params_within_limits.", flush=True)
 
     surrogate = None
     last_fit_step = 0
     if use_surrogate:
         surrogate = Surrogate(n_p)
-        _seed_surrogate_from_csv(surrogate, evals_path, n_params)
+        _seed_surrogate_from_csv(surrogate, evals_path, n_params,
+                                 rows=state["eval_rows"])
         if surrogate.n_obs >= max(SURROGATE_MIN_SAMPLES,
                                   surrogate_min_steps * n_walkers):
             surrogate.fit(epochs=surrogate_epochs, verbose=True,
@@ -1382,10 +1565,11 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
     seed_rows = []
     for w in range(n_walkers):
         if walker_values[w] is None:
-            v, det, el = _evaluate(w, walker_params[w], tuning_steps, stats,
-                                   log_each_solve, temp, tag="seed",
-                                   surrogate=surrogate)
-            seed_rows.append(_eval_row(w, walker_params[w], v, el, det, temp))
+            v, det, el, feas = _evaluate(w, walker_params[w], tuning_steps, stats,
+                                         log_each_solve, temp, tag="seed",
+                                         surrogate=surrogate)
+            seed_rows.append(_eval_row(w, walker_params[w], v, el, det, temp,
+                                       within_limits=feas))
             walker_values[w] = v
             if float(v) < float(best_value):
                 best_params, best_value = walker_params[w].copy(), v
@@ -1408,7 +1592,8 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
                        surrogate_progress_every=surrogate_progress_every,
                        # cumulative iteration index, so surrogate_rmse.csv is a
                        # continuous series across resumes rather than restarting
-                       step_offset=state["n_steps_done"])
+                       step_offset=state["n_steps_done"],
+                       check_limits=check_limits)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1417,8 +1602,8 @@ def continue_mcmc(steps, save_path="./csvs/", proposal_std=0.1, tuning_steps=16,
 
 _NM_HEADER = ["Eval", "Iter", "Parameters", "Value", "Time", "WithinLimits",
               "MinC", "MeanQ", "FreqLo", "FreqHi", "BestSoFar"]
- 
- 
+
+
 def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
            csv_name="nm_evals.csv", append=False, log_each=True,
            return_history=False):
@@ -1426,39 +1611,41 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
     Local refinement of a single geometry, on the RAW objective -- no constraint
     penalty. Nelder-Mead therefore never sees a plateau of tied PENALTY values and
     keeps full ordering information everywhere it steps.
- 
+
     The trade: NM will actually evaluate geometries outside the limits, which costs
     real FEM sweeps, and -- the part that matters -- an infeasible geometry can mesh
     and solve perfectly well and return an excellent FOM. NM will happily converge
     onto one.
- 
+
     EVERY evaluation is written to save_path/csv_name as it happens (flushed per
     row, so an interrupted run keeps everything up to the interruption). The
     WithinLimits column is what makes that log worth having: if NM converges to an
     infeasible point, the CSV still contains the best FEASIBLE geometry it visited,
     which is usually what you actually want. That point is reported at the end and
     returned in the history.
- 
+
     Note `Eval` counts objective calls while `Iter` counts NM iterations, which are
     NOT the same -- a simplex iteration costs one evaluation for a reflection and
     several for a shrink, so Iter lags Eval and repeats.
- 
+
     Feed it an MCMC optimum; do NOT feed its trajectory back into the MCMC or the
     surrogate -- hundreds of near-identical points in one basin distort the
     surrogate fit and add nothing to the chain.
- 
+
     Returns res.x, or (res.x, history) if return_history=True.
     """
     os.makedirs(save_path, exist_ok=True)
     path = os.path.join(save_path, csv_name)
+    # NOTE: `fresh` is True when we are APPENDING to an existing file (the name is
+    # historical); the header is written only when starting a new one.
     fresh = append and os.path.exists(path)
     with open(path, "a" if fresh else "w", newline="") as fh:
         if not fresh:
             csv.writer(fh).writerow(_NM_HEADER)
- 
+
     state = {"n": 0, "it": 0, "best": np.inf, "best_x": None,
              "best_feas": np.inf, "best_feas_x": None, "rows": []}
- 
+
     def objective(x):
         x = np.asarray(x, dtype=np.float64).ravel()
         t0 = time.perf_counter()
@@ -1471,7 +1658,7 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
             state["best"], state["best_x"] = value, x.copy()
         if feas and value < state["best_feas"]:
             state["best_feas"], state["best_feas_x"] = value, x.copy()
- 
+
         C, Q, f = details.get("C"), details.get("Q"), details.get("f")
         row = [state["n"], state["it"], _fmt_arr(x), value, elapsed, feas,
                (float(np.min(C)) if np.size(C) else ""),
@@ -1488,10 +1675,10 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
                   f"{'feasible' if feas else 'OUTSIDE LIMITS'} | "
                   f"best={state['best']:.6g}", flush=True)
         return value
- 
+
     def callback(xk):
         state["it"] += 1
- 
+
     try:
         res = scipy.optimize.minimize(
             objective, _as_7(x0), method="Nelder-Mead", callback=callback,
@@ -1502,7 +1689,7 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
               f"{path} holds everything so far.", flush=True)
         x_final = state["best_x"] if state["best_x"] is not None else _as_7(x0)
         f_final = state["best"]
- 
+
     print(f"\n[NM_opt] {state['n']} evaluations over {state['it']} iterations "
           f"-> {path}")
     print(f"[NM_opt] final point    : FOM={f_final:.6g}  {_fmt_params(x_final)}")
@@ -1520,7 +1707,7 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
         print(f"[NM_opt] note: a BETTER feasible point was visited earlier: "
               f"FOM={state['best_feas']:.6g}  "
               f"{_fmt_params(state['best_feas_x'])}", flush=True)
- 
+
     if return_history:
         return x_final, {"csv": path, "n_evals": state["n"],
                          "n_iters": state["it"], "rows": state["rows"],
@@ -1528,3 +1715,50 @@ def NM_opt(x0, max_iters, tuning_steps=16, save_path="./csvs/",
                          "best_feasible": state["best_feas"],
                          "best_feasible_x": state["best_feas_x"]}
     return x_final
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# seeding
+# ═════════════════════════════════════════════════════════════════════════════
+
+def generate_seeds(n, rng=None, max_draws=None):
+    """
+    n feasible starting geometries, drawn by constructive conditional sampling
+    plus a rejection check.
+
+    Each dependent coordinate is drawn from the interval its already-drawn parents
+    allow, which gets acceptance to ~98% rather than the ~4% a uniform draw over
+    the box would give. The price is that the result is NOT uniform over the
+    feasible set -- the conditional interval widths are not accounted for -- so
+    this is fine for seeding walkers and wrong for estimating feasible volume or
+    for any Monte-Carlo integral over the design space.
+
+    rng : optional np.random.Generator for reproducible seeds.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    max_draws = int(max_draws if max_draws is not None else 1000 * max(1, n))
+    seeds, draws = [], 0
+    while len(seeds) < n:
+        draws += 1
+        if draws > max_draws:
+            raise RuntimeError(
+                f"only {len(seeds)}/{n} feasible seeds in {max_draws} draws; the "
+                f"bounds are probably inconsistent (check H_TOL, SIDE_W_TOL and "
+                f"the angle/ctr_h clearance).")
+        ch = rng.uniform(H_MIN, H_MAX)
+        cw = rng.uniform(CTR_W_MIN, CTR_W_MAX)
+        proposal = np.array([
+            rng.uniform(ANGLE_MIN, ANGLE_MAX),                                # angle
+            rng.uniform(max((1 - H_TOL) * ch, H_MIN),
+                        min(H_MAX, (1 + H_TOL) * ch)),                        # div_h
+            rng.uniform(DIV_W_MIN, GAP0),                                     # div_w
+            cw,                                                               # ctr_w
+            rng.uniform(max(SIDE_W_MIN, (1 - SIDE_W_TOL) * cw),
+                        min(SIDE_W_MAX, (1 + SIDE_W_TOL) * cw)),              # side_w
+            ch,                                                               # ctr_h
+            rng.uniform(max(H_MIN, (1 - H_TOL) * ch),
+                        min(H_MAX, (1 + H_TOL) * ch)),                        # side_h
+        ])
+        if proposed_params_within_limits(proposal):
+            seeds.append(proposal)
+    return np.asarray(seeds)

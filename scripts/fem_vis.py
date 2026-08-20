@@ -223,7 +223,7 @@ def plot_modes(spec, result, n=None, save=None, cmap="RdBu_r"):
                 ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
         md = result["modes"][i]
         ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
-                     f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
+                     f"Q={md['Q']:.3g}", fontsize=9)
         ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(tp, ax=ax, fraction=0.035)
     for j in range(nmodes, nrow * ncol):
@@ -258,7 +258,7 @@ def plot_modes_square_magnitude(spec, result, n=None, save=None, cmap="RdBu_r"):
                 ax.plot(m.p[0][f] * MM, m.p[1][f] * MM, color=col, lw=1.0)
         md = result["modes"][i]
         ax.set_title(f"f={result['freqs'][i]/1e9:.4f} GHz   C={md['C']:.3f}\n"
-                        f"Q={md['Q']:.3g}   loc={md['localisation']:.3f}", fontsize=9)
+                        f"Q={md['Q']:.3g}", fontsize=9)
         ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(tp, ax=ax, fraction=0.035)
     for j in range(nmodes, nrow * ncol):
@@ -325,7 +325,7 @@ def plot_best_modes(entries, save=None, cmap="RdBu_r", ncol=4,
         md = r["modes"][i]
         head = (lab + "\n") if lab else ""
         ax.set_title(f"{head}f={r['freqs'][i]/1e9:.3f} GHz  C={md['C']:.3f}\n"
-                     f"Q={md['Q']:.3g}  loc={md['localisation']:.3f}", fontsize=8)
+                     f"Q={md['Q']:.3g}", fontsize=8)
         ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(tp, ax=ax, fraction=0.04)
     for j in range(n, nrow * ncol):
@@ -385,7 +385,7 @@ def plot_best_modes_magnitude_square(entries, save=None, cmap="RdBu_r", ncol=4,
         md = r["modes"][i]
         head = (lab + "\n") if lab else ""
         ax.set_title(f"{head}f={r['freqs'][i]/1e9:.3f} GHz  C={md['C']:.3f}\n"
-                     f"Q={md['Q']:.3g}  loc={md['localisation']:.3f}", fontsize=8)
+                     f"Q={md['Q']:.3g}", fontsize=8)
         ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(tp, ax=ax, fraction=0.04)
     for j in range(n, nrow * ncol):
