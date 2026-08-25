@@ -118,17 +118,25 @@ Note that the space in which $\delta$ lives has much higher dimension than $\mat
 
 ## Parameter limits
 
-In `mcmc.py`, lines 66-73 currently are
+In `mcmc.py`, lines 78-85 currently are
 
 ```python
 ANGLE_MIN, ANGLE_MAX   = 0.0, 50.0     # was [0, 70]
 H_MIN, H_MAX           = 90.0, 145.0   # ALL heights: div_h, ctr_h, side_h
-H_TOL                  = 0.2           # div_h, side_h within +/-20% of ctr_h
+H_TOL                  = 0.2           # div_h, side_h within +/-H_TOL of ctr_h
 CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
 SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0     # side width capped at 20 mm
-SIDE_W_TOL             = 0.4           # side_w within +/-40% of ctr_w
-DIV_W_MIN              = 3.0           # div_w in [3, gap0)
-TOTAL_W_MAX            = 400.0 / np.sqrt(2.0)
+SIDE_W_TOL             = 0.4           # side_w within +/-SIDE_W_TOL of ctr_w
+DIV_W_MIN              = 3.0           
+DIV_W_MAX              = 20.0
 ```
 
-These are the chosen parameters for a given run. If you want to change them, you only need to change them here. If you are optimizing the noisy objective, 
+These are the chosen parameters for a given run. If you want to change them, you only need to change them here. If you are optimizing the noisy objective, run
+
+```python
+import noisy_mcmc as nz
+
+nz.install(check_limits="geometry")
+```
+
+The `check_limits="geometry"` ensures that any geometry which is either unbuildable or buildable yet has self-intersecting pieces, etc. doesn't get evaluated, while valid geometries that are NOT within `proposed_params_within_limits` do get built. By default, `c_cutoff` is set to `True`, unless you're working in `stability_analysis` in which it's set ot `False`. (Most likely, if you're running optimization on the noisy objective, you will have to set `c_cutoff=False` after running `install()`, i.e. run `mcmc.minimze(..., c_cutoff=False)`.)
