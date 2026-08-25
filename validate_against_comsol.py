@@ -14,6 +14,7 @@ if __name__ == "__main__":
 
     #mcmc.sim_sweep(rounded_params, plot_all=True, mesh_uniform=True)
     #mcmc.sim_sweep([0.16899349, 128.74669068, 5.83007533, 10., 9.41222406,  10.9485037, 123.2129638, 124.9380107], plot_all=True)
-    x0 = [0.16899349, 128.74669068, 5.83007533, 10., 9.41222406,  10.9485037, 123.2129638, 124.9380107]
+    x0 = [9.71851258,127.23060036, 11.02606533, 14.4991172 , 15.65917039,124.90989748,123.52196735]
     nz.plot_samples(x0, cov=nz.default_cov(), n=8, save="TEMP/perturb.png")
     nz.describe_samples(x0, cov=nz.default_cov(), n=8)
+    nz.field_report(x0, n=5, tuning_index=0, save_prefix="TEMP/field")

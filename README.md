@@ -113,3 +113,22 @@ Note that the space in which $\delta$ lives has much higher dimension than $\mat
 ## Efficacy of the MLP
 
 (WIP) During stage 2 of the optimization procedure, we compute the intermediate RMSE and Spearman $\rho$ and Kendall $\tau$ coefficients to determine how well the surrogate 1) knows where it's guiding each walker, and 2) can effectively rank different parameters.
+
+# Notes about usage
+
+## Parameter limits
+
+In `mcmc.py`, lines 66-73 currently are
+
+```python
+ANGLE_MIN, ANGLE_MAX   = 0.0, 50.0     # was [0, 70]
+H_MIN, H_MAX           = 90.0, 145.0   # ALL heights: div_h, ctr_h, side_h
+H_TOL                  = 0.2           # div_h, side_h within +/-20% of ctr_h
+CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
+SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0     # side width capped at 20 mm
+SIDE_W_TOL             = 0.4           # side_w within +/-40% of ctr_w
+DIV_W_MIN              = 3.0           # div_w in [3, gap0)
+TOTAL_W_MAX            = 400.0 / np.sqrt(2.0)
+```
+
+These are the chosen parameters for a given run. If you want to change them, you only need to change them here. If you are optimizing the noisy objective, 

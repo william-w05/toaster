@@ -81,9 +81,10 @@ H_TOL                  = 0.2           # div_h, side_h within +/-H_TOL of ctr_h
 CTR_W_MIN, CTR_W_MAX   = 3.0, 20.0
 SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0     # side width capped at 20 mm
 SIDE_W_TOL             = 0.4           # side_w within +/-SIDE_W_TOL of ctr_w
-DIV_W_MIN              = 3.0           # div_w in [3, gap0)
+DIV_W_MIN              = 3.0           
+DIV_W_MAX              = 20.0
 # NOTE: TOTAL_W_MAX ~ 282.8 mm, but the widest geometry the other bounds allow is
-# 20 + 2*10 + 2*10 + 4*10 + 2*20 = 140 mm, so this test can never fire. Kept as
+# 20 + 2*10 + 2*20 + 4*10 + 2*20 = 160 mm, so this test can never fire. Kept as
 # documentation of the physical envelope; it would bind again if the width caps
 # were relaxed.
 TOTAL_W_MAX            = 400.0 / np.sqrt(2.0)
@@ -369,7 +370,7 @@ def proposed_params_within_limits(proposal):
         return False
     if side_w >= (1 + SIDE_W_TOL) * ctr_w or side_w < (1 - SIDE_W_TOL) * ctr_w:
         return False
-    if div_w < DIV_W_MIN or div_w >= GAP0:
+    if div_w < DIV_W_MIN or div_w >= DIV_W_MAX:
         return False
 
     # TOTAL WIDTH: ctr_w + 2*gap0 + 2*div_w + 4*gap1 + 2*side_w

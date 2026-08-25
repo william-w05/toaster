@@ -31,6 +31,20 @@ MM = 1000.0     # metres -> mm for display
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def _add_rect(ax, r, **kw):
+    """
+    Draw a Rect as a patch, HONOURING its rotation.
+
+    MplRect takes (lower-left, w, h) and knows nothing about Rect.angle, so a
+    tilted bar used to be drawn upright while the mesher rotated it. Rect.corners()
+    already returns the rotated corners, so fall through to a Polygon whenever
+    there is an angle.
+    """
+    from matplotlib.patches import Polygon as MplPolygon
+    if getattr(r, "angle", 0.0):
+        return ax.add_patch(MplPolygon(r.corners() * MM, closed=True, **kw))
+    return ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM, **kw))
+
 def _label(ax, r, text, i):
     """Place a label legibly: rotate inside tall thin rectangles, stagger heights."""
     rot = 90 if r.h > 2.0 * r.w else 0
@@ -70,18 +84,16 @@ def plot_spec(spec, ax=None, save=None, annotate=True, show_centers=True,
                              lw=2.0, zorder=0))
 
     for i, r in enumerate(spec.metal):
-        ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
-                             facecolor="#9aa5b1", edgecolor="#33404d", lw=1.4,
-                             hatch="///", zorder=2))
+        _add_rect(ax, r, facecolor="#9aa5b1", edgecolor="#33404d", lw=1.4,
+                  hatch="///", zorder=2)
         if show_centers:
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
             _label(ax, r, f"{r.name}  {r.w*MM:.1f}x{r.h*MM:.1f}", i)
 
     for i, (r, mat) in enumerate(spec.dielectric):
-        ax.add_patch(MplRect((r.x0 * MM, r.y0 * MM), r.w * MM, r.h * MM,
-                             facecolor="#f6d9a0", edgecolor="#a8791f", lw=1.4,
-                             alpha=0.9, zorder=1))
+        _add_rect(ax, r, facecolor="#f6d9a0", edgecolor="#a8791f", lw=1.4,
+                  alpha=0.9, zorder=1)
         if show_centers:
             ax.plot(r.cx * MM, r.cy * MM, "k+", ms=7, zorder=4)
         if annotate:
@@ -126,8 +138,10 @@ def _overlap_warnings(spec, ax):
     for i in range(len(rects)):
         for j in range(i + 1, len(rects)):
             a, _ = rects[i]; b, _ = rects[j]
-            if (a.x0 < b.x0 + b.w - 1e-12 and b.x0 < a.x0 + a.w - 1e-12 and
-                    a.y0 < b.y0 + b.h - 1e-12 and b.y0 < a.y0 + a.h - 1e-12):
+            ax0, ay0, ax1, ay1 = a.bounds        # rotation-aware, like the
+            bx0, by0, bx1, by1 = b.bounds        # out-of-bounds test above
+            if (ax0 < bx1 - 1e-12 and bx0 < ax1 - 1e-12 and
+                    ay0 < by1 - 1e-12 and by0 < ay1 - 1e-12):
                 msgs.append(f"'{a.name}' overlaps '{b.name}'")
     if msgs:
         ax.text(0.01, 0.99, "WARNING\n" + "\n".join(msgs[:5]),
@@ -392,7 +406,7 @@ def plot_best_modes_magnitude_square(entries, save=None, cmap="RdBu_r", ncol=4,
         axes[j // ncol][j % ncol].axis("off")
 
     fig.suptitle(suptitle or "highest form-factor mode across the tuning range",
-                 y=1.0, fontsize=11)
+                 y=1.0, fontsize=20)
     if save:
         fig.tight_layout(); fig.savefig(save, dpi=140); plt.close(fig)
     return fig

@@ -1055,18 +1055,19 @@ def plot_sweep(res, out):
             #                       res[key] + res[key + "_se"],
             #                       color=ln.get_color(), alpha=.18)
     ax[0].axhline(0, color="k", lw=.8)
-    ax[0].set_ylabel(r"Within-batch Spearman $\rho$")
+    ax[0].set_ylabel(r"Within-batch Spearman $\rho$", fontsize="large")
     ax[0].legend(fontsize=9); ax[0].grid(alpha=.3)
 
     if "acc_pick" in res:
         ax[1].plot(x, res["acc_pick"], "o-", ms=4, label="screened pick")
     if "acc_rand" in res:
         ax[1].plot(x, res["acc_rand"], "s-", ms=4, label="random proposal")
-    ax[1].set_ylabel("Mean acceptance probability"); ax[1].set_yscale("log")
+    ax[1].set_ylabel("Mean acceptance probability", fontsize="large"); ax[1].set_yscale("log")
     ax[1].legend(fontsize=9); ax[1].grid(alpha=.3)
-    ax[1].set_xlabel("MCMC iteration")
+    ax[1].set_xlabel("MCMC iteration", fontsize="large")
+    plt.suptitle("Surrogate metrics vs. MCMC iteration", fontsize=20)
 
-    '''if "hit1" in res:
+    r'''if "hit1" in res:
         ax[1].plot(x, res["hit1"], "o-", ms=4, label="precision@1")
         if "n_cand" in res and "n_batches" in res:
             ax[1].plot(x, res["n_batches"] / res["n_cand"], "k--", lw=1,
@@ -1421,9 +1422,9 @@ def main(argv=None):
     p.add_argument("--every", type=int, default=1,
                    help="use every Nth checkpoint (raise this to cut cost)")
     p.add_argument("--n-walkers-sweep", type=int, default=10)
-    p.add_argument("--n-per-walker", type=int, default=15,
-                   help="proposals per walker; 10 x 15 = 150 per checkpoint")
-    p.add_argument("--sweep-evals", default="sweep_evals.csv")
+    p.add_argument("--n-per-walker", type=int, default=100,
+                   help="proposals per walker; 10 x 100 = 150 per checkpoint")
+    p.add_argument("--sweep-evals", default="sweep_evals1.csv")
     p.add_argument("--dry-run", action="store_true",
                    help="print the plan and cost estimate, then stop")
 
@@ -1444,7 +1445,7 @@ def main(argv=None):
             args.walker_states = os.path.join(args.root,
                                               "all_params_all_values.csv")
     if args.mode == "sweep" and args.out == "surrogate_topk.csv":
-        args.out = "sweep_metrics.csv"
+        args.out = "sweep_metrics1.csv"
     {"topk": mode_topk, "batch": mode_batch, "score": mode_score,
      "sweep": mode_sweep}[args.mode](args)
 
