@@ -8,3 +8,5 @@ __pycache__/
 .pytest_cache/
 results/
 TEMP/
+additional_results/
+build_files/

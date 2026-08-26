@@ -672,7 +672,6 @@ def solve_cavity(spec, n_modes: int = 6, f_target: float | None = None,
         except OSError:
             pass
     element = ElementTriP2() if order == 2 else ElementTriP1()
-
     basis, K, M = _assemble(mesh, element, spec, diel_mats)
 
     # PEC (E_z = 0) on every conducting boundary

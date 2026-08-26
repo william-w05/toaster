@@ -58,7 +58,7 @@ _NUM = _re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 # ── geometry, MILLIMETERS ───────────────────────────────────────────────────
 GAP0          = 10.0     # fixed gap flanking the centre toast
-GAP1          = 10.0     # FIXED: no longer a free parameter
+GAP1          = 10.0      # FIXED: no longer a free parameter
 CAVITY_HEIGHT = 160.0
 X_MAX_FREQ    = 8.75     # |x| that tunes 15 GHz -> 8 GHz
 F_MAX         = 3e11 / (2.0 * GAP0)          # 15 GHz at x=0 (c = 3e11 mm/s)

@@ -442,7 +442,7 @@ def plot_tuning_summary(entries, save=None, min_localisation=0.0, xvals=None,
 
 # ─────────────────────────────────────────────────────────────────────────────
 def toaster_spec(params, cavity_w=None, cavity_h=0.160, gap0=0.010, gap1=None,
-                 toast_dx=0.0, toast_dy=0.0, mesh_size=0.002, tag="toaster",
+                 toast_dx=0.0, toast_dy=0.0, mesh_size=0.001, tag="toaster",
                  wall_material=None, metal_material=None, mesh_uniform=False,
                  center_x=None, center_y=None):
     """

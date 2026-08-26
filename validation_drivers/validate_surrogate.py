@@ -63,7 +63,7 @@ SIDE_W_MIN, SIDE_W_MAX = 3.0, 20.0
 # current sampler. Replaying an archived run needs the value that was in force
 # then, or the feasible pool will not match. Override with --side-w-tol.
 SIDE_W_TOL = 0.4
-DIV_W_MIN = 3.0
+DIV_W_MIN, DIV_W_MAX = 3.0, 20.0
 TOTAL_W_MAX = 400.0 / np.sqrt(2.0)
 GAP0 = GAP1 = 10
 CAVITY_HEIGHT = 160
@@ -86,7 +86,7 @@ N_SCREEN = 64
 PARAM_RANGE = np.array([
     ANGLE_MAX - ANGLE_MIN,          # angle   50
     H_MAX - H_MIN,                  # div_h   55
-    GAP0 - DIV_W_MIN,               # div_w    7
+    DIV_W_MAX - DIV_W_MIN,          # div_w   17
     CTR_W_MAX - CTR_W_MIN,          # ctr_w   17
     SIDE_W_MAX - SIDE_W_MIN,        # side_w  17
     H_MAX - H_MIN,                  # ctr_h   55
@@ -328,7 +328,7 @@ def find_checkpoints(d):
     out = [(int(m.group(1)), os.path.join(d, fn))
            for fn in os.listdir(d) if (m := CKPT_RE.search(fn))]
     if not out:
-        raise SystemExit(f"no surrogate_step#####.pt in {d}")
+        raise SystemExit(f"no surrogate_step.pt in {d}")
     return sorted(out)
 
 

@@ -1,10 +1,11 @@
 numpy
 scipy
-gmsh
-scikit-fem
+gmsh==4.15.2
+scikit-fem==12.0.2
 matplotlib
 meshio
 torch
 tqdm
 pandas
 PyQt6
+pyvista[jupyter]
