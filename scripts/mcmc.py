@@ -41,9 +41,6 @@ from collections import deque
 
 import numpy as np
 import scipy
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
 
 from . import fem_solve as fem
@@ -51,6 +48,47 @@ from . import fem_vis as viz
 
 _NUM = _re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
+torch = nn = optim = None
+_dev = None
+
+torch = nn = optim = None
+_dev = None
+_SurrogateNet = None
+
+
+def _load_torch():
+    """Import torch on demand and define torch-dependent classes."""
+    global torch, nn, optim, _dev, _SurrogateNet
+
+    if torch is None:
+        import torch as _t
+        import torch.nn as _nn
+        import torch.optim as _optim
+
+        torch, nn, optim = _t, _nn, _optim
+        _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        class _LazySurrogateNet(nn.Module):
+            """params -> predicted LOG objective."""
+
+            def __init__(self, d, hidden=SURROGATE_HIDDEN):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(d, hidden),
+                    nn.SiLU(),
+                    nn.Linear(hidden, hidden),
+                    nn.SiLU(),
+                    nn.Linear(hidden, hidden // 2),
+                    nn.SiLU(),
+                    nn.Linear(hidden // 2, 1),
+                )
+
+            def forward(self, x):
+                return self.net(x).squeeze(-1)
+
+        _SurrogateNet = _LazySurrogateNet
+
+    return torch
 
 # ═════════════════════════════════════════════════════════════════════════════
 # constants
@@ -123,7 +161,7 @@ SURROGATE_BUFFER        = 20000
 # error instead of spinning forever
 MAX_BATCH_RETRIES = 1000
 
-_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -448,6 +486,7 @@ def _batch_proposals(log_params, proposal_std, n=64, df=3, clip=2.0,
 
     clip is in units of proposal_std, applied to the standardised step.
     """
+    _load_torch()
     mode = PROPOSAL_MODE if mode is None else mode
     d = log_params.shape[0]
     lp = torch.tensor(log_params, dtype=torch.float64, device=_dev)
@@ -624,10 +663,11 @@ def _flush_rows(path, rows, width=None):
 # surrogate MLP
 # ═════════════════════════════════════════════════════════════════════════════
 
-class _SurrogateNet(nn.Module):
-    """params -> predicted LOG objective."""
+"""class _SurrogateNet(nn.Module):
+    params -> predicted LOG objective.
 
     def __init__(self, d, hidden=SURROGATE_HIDDEN):
+        _load_torch()
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d, hidden), nn.SiLU(),
@@ -637,7 +677,7 @@ class _SurrogateNet(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        return self.net(x).squeeze(-1)"""
 
 
 class Surrogate:
@@ -661,6 +701,7 @@ class Surrogate:
     def __init__(self, input_dim, min_samples=SURROGATE_MIN_SAMPLES,
                  buffer_size=SURROGATE_BUFFER, hidden=SURROGATE_HIDDEN,
                  lr=SURROGATE_LR):
+        _load_torch()
         self.d = int(input_dim)
         self.min_samples = int(min_samples)
         self._buf = deque(maxlen=buffer_size)     # training set
@@ -871,6 +912,7 @@ class Surrogate:
     @classmethod
     def load_checkpoint(cls, path, restore_rng=False):
         """Rebuild a Surrogate saved by save_checkpoint()."""
+        _load_torch()
         ck = torch.load(path, map_location=_dev, weights_only=False)
         s = cls(ck["d"], min_samples=ck["min_samples"])
         s.net.load_state_dict(ck["net"]); s.opt.load_state_dict(ck["opt"])

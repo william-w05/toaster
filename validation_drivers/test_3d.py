@@ -21,6 +21,9 @@ READ THIS FIRST, it will save you a night:
     not that the code is broken. In a prism only p = 0 has nonzero form factor.
 """
 
+import os
+#os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
 import numpy as np
 
@@ -35,7 +38,7 @@ from scripts import mcmc
 # A) the 7-parameter toaster: extrude -> visualise -> solve
 # ═════════════════════════════════════════════════════════════════════════════
 
-def example_A(length_m=0.20, mesh_size=0.004, outdir="TEMP/ex3d",
+def example_A(length_m=0.16, mesh_size=0.002, outdir="TEMP/ex3d",
               run_3d=True, n_modes=6):
     """
     params_mm is the usual DESIGN VECTOR:
@@ -65,7 +68,7 @@ def example_A(length_m=0.20, mesh_size=0.004, outdir="TEMP/ex3d",
 
     # ---- 2. solve it in 2D (cheap, accurate, and the frequency you need) -----
     f_guess = 3e8 / (2.0 * mcmc.GAP0_M)              # ~15 GHz at x = 0
-    r2 = f2.solve_cavity(spec2d, n_modes=6, f_target=f_guess, keep_fields=True)
+    r2 = f2.solve_cavity(spec2d, n_modes=n_modes, f_target=f_guess, keep_fields=True)
     m2 = f2.best_mode(r2)
     print(f"[2D]  f = {m2['f']/1e9:.4f} GHz   C = {m2['C']:.4f}   "
           f"Q = {m2['Q']:.0f}")
@@ -85,24 +88,39 @@ def example_A(length_m=0.20, mesh_size=0.004, outdir="TEMP/ex3d",
                         save=f"{outdir}/length_scan.png")
 
     # ---- 4. extrude to a 3D spec --------------------------------------------
+    #spec3d = f3.from_2d(spec2d, length=length_m, mesh_size=mesh_size)
+
+    d = f3.diagnose_import  # no - use the mesh directly:
     spec3d = f3.from_2d(spec2d, length=length_m, mesh_size=mesh_size)
+    v3.plot_mesh_3d(spec3d, save="TEMP/check.html", show=False, clip="x")
+    #    clip x rather than y, and look end-on at a bar: is there a vacuum gap
+    #    between the bar end and the endcap?
+
+    # 2. compare against a geometry where the bars deliberately stop short
+    #spec_short = f3.from_2d(spec2d, length=0.06, mesh_size=0.004,
+    #                        partial={n: (-0.028, 0.056) for n in
+    #                                ("center_toast","side_toastL","side_toastR",
+    #                                "dividerL","dividerR")})
+
     v3.check_spec_3d(spec3d)
 
     # ---- 5. visualise, interactively ----------------------------------------
     v3.plot_spec_3d(spec3d, save=f"{outdir}/toaster_spec.html", show=False)
     v3.plot_mesh_3d(spec3d, save=f"{outdir}/toaster_mesh.html", show=False,
                     clip="y")     # clip the wall away to see the bars inside
-    print(f"[vis] wrote {outdir}/toaster_spec.html and toaster_mesh.html "
+    print(f"[vis] wrote {outdir}/sample_toaster_spec.html and toaster_mesh.html "
           f"-- open them in a browser, they rotate and zoom")
 
     if not run_3d:
         return {"r2": r2, "extruded": modes, "spec3d": spec3d}
 
     # ---- 6. the 3D solve, as a CROSS-CHECK ----------------------------------
-    # Aim at the 2D frequency. Anything else lands among the channel modes and
-    # every C comes back 0.
-    r3 = f3.solve_cavity_3d(spec3d, n_modes=n_modes, f_target=m2["f"],
+    # Aim at the 2D frequency. 
+    r3 = f3.solve_cavity_3d(spec3d, n_modes=n_modes, f_target=15e9,
                             keep_fields=True)
+    #("outer bounds:", spec3d.outer.bounds)
+    #for b in spec3d.metal:
+    #    print("metal", b.name, "bounds:", b.bounds)
     m3 = f3.best_mode(r3)
     print(f"[3D]  {r3['n_elements']} tets, {r3['n_free']} dofs")
     print(f"      f = {m3['f']/1e9:.4f} GHz ({(m3['f']/modes[0]['f']-1)*100:+.2f}% "

@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import os
 import io
+import sys
 import re as _re
 import uuid
 import tempfile
@@ -793,13 +794,142 @@ def _surface_samples(tag, n=4):
 # side mesh_size. Calibrated on the pillbox: 0.785 m^3 at h = 83 mm gave 7891
 # tets, i.e. 5.8 per h^3. Used only to catch a runaway BEFORE gmsh starts.
 _TETS_PER_H3 = 6.0
-MAX_ELEMENTS = 1_500_000
+MAX_ELEMENTS = 10_000_000
 
 
 def estimate_elements(volume, mesh_size):
     """Rough tetrahedron count for a volume at a given element size."""
     h = float(mesh_size)
     return float(_TETS_PER_H3 * float(volume) / (h ** 3)) if h > 0 else np.inf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# linear solver: SuperLU (always there) or MKL PARDISO (much faster)
+# ─────────────────────────────────────────────────────────────────────────────
+
+LINEAR_SOLVER = "auto"          # "auto" | "pardiso" | "superlu"
+_PARDISO_WARNED = [False]
+
+
+def openmp_conflict_hint():
+    """
+    Explain an OpenMP/MKL clash if one is likely, else "".
+
+    On Windows, PyTorch ships its own libiomp5md.dll in torch/lib and the `mkl`
+    wheel behind pypardiso ships another in Library/bin. Whichever loads first
+    wins; the second prints "OMP: Error #15 ... already initialized" and PARDISO
+    then dies with an access violation inside MKL. It is not a missing package,
+    and reinstalling pypardiso will not help.
+    """
+    if "torch" not in sys.modules:
+        return ""
+    return (
+        "\n  LIKELY CAUSE: torch is imported in this process. PyTorch and MKL each "
+        "bundle their own\n"
+        "  OpenMP runtime (libiomp5md.dll) and they cannot coexist -- that is the "
+        "'OMP: Error #15'\n"
+        "  above, and the access violation after it.\n"
+        "  FIX: keep torch out of the process that runs the 3D solver. Nothing in "
+        "fem_solve_3d or\n"
+        "  fem_vis_3d needs it; it arrives via mcmc.py, which imports torch at "
+        "module level for the\n"
+        "  surrogate. Either drop the `import mcmc` from your 3D script, or make "
+        "that import lazy\n"
+        "  (move `import torch` inside mcmc.Surrogate).\n"
+        "  KMP_DUPLICATE_LIB_OK=TRUE silences the message but Intel warns it can "
+        "silently produce\n"
+        "  WRONG ANSWERS -- do not use it for a solver you intend to trust.")
+
+
+def pardiso_available(explain=False):
+    """
+    True if MKL PARDISO can actually be used -- importable AND able to factorise.
+
+    A bare `import pypardiso` succeeding proves nothing: the OpenMP clash below
+    only shows up when MKL is first asked to do work. So this runs a 3x3 solve.
+    """
+    try:
+        import pypardiso
+        A = sp.eye(3, format="csr") * 2.0
+        x = pypardiso.spsolve(A, np.ones(3))
+        ok = bool(np.allclose(x, 0.5))
+        if explain and not ok:
+            print("[3d] pypardiso imported but returned a wrong answer",
+                  flush=True)
+        return ok
+    except Exception as e:
+        if explain:
+            print(f"[3d] pypardiso unusable: {type(e).__name__}: {e}"
+                  f"{openmp_conflict_hint()}", flush=True)
+        return False
+
+
+def _is_symmetric(A, tol=1e-10):
+    """Cheap structural+numeric symmetry test, O(nnz)."""
+    n = sp.linalg.norm(A)
+    if n == 0:
+        return True
+    return bool(sp.linalg.norm((A - A.T).tocsr()) <= tol * n)
+
+
+def _factorized(A, kind=None, permc_spec="COLAMD", spd=False, progress=None):
+    """
+    Factorise A once and return a callable solve(b) -> x, plus a label.
+
+    WHY THIS EXISTS. A 3D shift-invert solve is dominated by ONE sparse LU:
+    measured on a 36,909-dof curl-curl matrix, SuperLU took 30.6 s and produced
+    68 million nonzeros of fill. MKL PARDISO factorises the same matrix in 1.4 s,
+    and in 0.75 s if told the matrix is symmetric -- a 27x speedup on a SINGLE
+    core, before any threading. That is the difference between iterating on a
+    design and not.
+
+    spd : the matrix is symmetric POSITIVE DEFINITE (the gradient projector
+        G^T M G is; the shift-invert matrix K - sigma*M is not, it is symmetric
+        INDEFINITE). PARDISO wants different matrix types for the two.
+
+    THE TRAP with PARDISO's symmetric modes: it expects ONLY THE UPPER TRIANGLE.
+    Hand it the full matrix and you get a silently wrong answer, not an error. So
+    symmetry is verified numerically first and the triangle is extracted here;
+    if the matrix turns out not to be symmetric we fall back to the unsymmetric
+    mode rather than guessing.
+
+    Falls back to SuperLU on any PARDISO failure, warning once, so a machine
+    without MKL still runs.
+    """
+    kind = (LINEAR_SOLVER if kind is None else kind).lower()
+    if kind in ("auto", "pardiso"):
+        try:
+            import pypardiso
+            sym = _is_symmetric(A)
+            mtype = (2 if spd else -2) if sym else 11
+            ps = pypardiso.PyPardisoSolver(mtype=mtype)
+            Af = (sp.triu(A, format="csr") if mtype in (2, -2) else A.tocsr())
+            Af.indptr = Af.indptr.astype(np.int32, copy=False)
+            Af.indices = Af.indices.astype(np.int32, copy=False)
+            Af.data = np.ascontiguousarray(Af.data, dtype=np.float64)
+            ps.factorize(Af)
+
+            def solve(b, _ps=ps, _A=Af):
+                return _ps.solve(_A, np.ascontiguousarray(b, dtype=np.float64))
+
+            solve.free = ps.free_memory
+            return solve, f"pardiso(mtype={mtype})"
+        except Exception as e:                                # pragma: no cover
+            if kind == "pardiso":
+                raise
+            if not _PARDISO_WARNED[0]:
+                _PARDISO_WARNED[0] = True
+                hint = openmp_conflict_hint()
+                if not hint and "pypardiso" not in sys.modules:
+                    hint = "\n  pip install pypardiso"
+                print(f"[3d] MKL PARDISO unavailable ({type(e).__name__}: {e}); "
+                      f"falling back to SuperLU, which is ~25x slower on the "
+                      f"shift-invert factorisation.{hint}", flush=True)
+    lu = splu(A, permc_spec=permc_spec)
+    solve = lambda b: lu.solve(b)                              # noqa: E731
+    solve.free = lambda: None
+    solve._lu = lu
+    return solve, f"superlu({permc_spec})"
 
 
 class _Progress:
@@ -1280,7 +1410,7 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
                     drop_below: float = 1e-3, check_kernel: bool = True,
                     axis: str = "z", max_elements: int = MAX_ELEMENTS,
                     progress: bool = False, progress_every: int = 25,
-                    permc_spec: str = "COLAMD"):
+                    permc_spec: str = "COLAMD", linear_solver: str = None):
     """
     Build -> mesh -> solve one 3D configuration.
 
@@ -1309,6 +1439,19 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
         the CAD used -- check the bounding box printed by ImportedSpec3D: the long
         direction is usually the axis. Getting this wrong gives C ~ 0 for the
         operating mode with no other symptom.
+
+    linear_solver : "auto" (default, module LINEAR_SOLVER), "pardiso" or
+        "superlu". "auto" uses MKL PARDISO when pypardiso imports and silently
+        falls back to SuperLU otherwise, warning once. Measured on a 36,909-dof
+        curl-curl matrix, single core:
+
+            SuperLU              factorize 30.6 s + 20 solves 1.6 s = 32.2 s
+            PARDISO unsymmetric  1.4 s + 0.6 s                      =  2.0 s
+            PARDISO symmetric    0.8 s + 0.5 s                      =  1.2 s   27x
+
+        Answers agree to 1e-13. THREADS: PARDISO uses all cores via MKL, so set
+        MKL_NUM_THREADS=1 in run_batch workers or they will oversubscribe and run
+        slower than one process would.
 
     permc_spec : fill-reducing ordering for the shift-invert factorisation, which
         is where a 3D solve actually spends its time (measured: 35 s of a 44 s run
@@ -1400,14 +1543,17 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
         Gc = discrete_gradient(mesh)[I][:, inodes].tocsc()
         kernel_dim = Gc.shape[1]
         S = (Gc.T @ Mc @ Gc).tocsc()
-        Slu = splu(S)
-        pg(f"gradient projector factorised ({kernel_dim:,} kernel modes deflated)")
+        Ssolve, slabel = _factorized(S, linear_solver, permc_spec, spd=True)
+        pg(f"gradient projector factorised [{slabel}] "
+           f"({kernel_dim:,} kernel modes deflated)")
         A = (Kc - sigma * Mc).tocsc()
-        Alu = splu(A, permc_spec=permc_spec)
-        pg(f"shift-invert factorised: fill-in {Alu.L.nnz + Alu.U.nnz:,} nnz")
+        Asolve, alabel = _factorized(A, linear_solver, permc_spec, spd=False)
+        fill = (f", fill-in {Asolve._lu.L.nnz + Asolve._lu.U.nnz:,} nnz"
+                if hasattr(Asolve, "_lu") else "")
+        pg(f"shift-invert factorised [{alabel}]{fill}")
 
         def _P(x):
-            return x - Gc @ Slu.solve(Gc.T @ (Mc @ x))
+            return x - Gc @ Ssolve(Gc.T @ (Mc @ x))
 
         # P on BOTH sides: that is what keeps the operator M-self-adjoint, which
         # ARPACK's symmetric shift-invert mode assumes. One-sided is not.
@@ -1421,7 +1567,7 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
                 dt = time.perf_counter() - _count["t"]
                 pg(f"eigensolve: {_count['n']} operator applications "
                    f"({_count['n'] / max(dt, 1e-9):.1f}/s)")
-            return _P(Alu.solve(_P(x)))
+            return _P(Asolve(_P(x)))
 
         OPinv = LinearOperator(Kc.shape, dtype=np.float64, matvec=_op)
 
@@ -1430,6 +1576,15 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
     vals, vecs = eigsh(Kc, k=n_modes, M=Mc, sigma=sigma, which="LM",
                        OPinv=OPinv, tol=tol, ncv=ncv)
     pg("eigensolve done; computing C and Q")
+    if deflate:
+        # PARDISO holds its factors in MKL-side memory that Python's GC does not
+        # own; without this a sweep of many geometries leaks until the machine
+        # swaps. Harmless no-op on the SuperLU path.
+        for _s in (Asolve, Ssolve):
+            try:
+                _s.free()
+            except Exception:
+                pass
 
     order = np.argsort(np.real(vals))
     out = {"freqs": [], "modes": [], "n_dofs": int(basis.N),
