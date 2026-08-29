@@ -304,6 +304,8 @@ class CavitySpec3D:
     mesh_size: float = 0.004
     mesh_size_min: float | None = None
     mesh_uniform: bool = False
+    refine_edges: bool = True
+    refine_dist: float | None = None
     tag: str = ""
 
     def add_outer(self, occ):
@@ -808,6 +810,7 @@ def estimate_elements(volume, mesh_size):
 # ─────────────────────────────────────────────────────────────────────────────
 
 LINEAR_SOLVER = "auto"          # "auto" | "pardiso" | "superlu"
+MESH_THREADS = 0                # 0 -> all cores; set to 1 inside run_batch workers
 _PARDISO_WARNED = [False]
 
 
@@ -983,6 +986,12 @@ def build_mesh_3d(spec, msh_path: str, verbose: bool = False,
     gmsh.initialize()
     try:
         gmsh.option.setNumber("General.Terminal", 1 if verbose else 0)
+        # gmsh is single-threaded unless told otherwise, which is a large part of
+        # why CPU sits near one core during meshing. HXT in particular scales.
+        gmsh.option.setNumber("General.NumThreads", int(MESH_THREADS or
+                                                        (os.cpu_count() or 1)))
+        gmsh.option.setNumber("Mesh.MaxNumThreads3D", int(MESH_THREADS or
+                                                          (os.cpu_count() or 1)))
         if verbose:
             # gmsh reports "Meshing 3D... (n%)" only at this verbosity; without it
             # a long mesh is indistinguishable from a hang
@@ -1086,6 +1095,7 @@ def build_mesh_3d(spec, msh_path: str, verbose: bool = False,
         # `scale` means the CAD is in other units (mm, usually) while mesh_size is
         # in METRES, so the size targets have to be expressed in file units.
         fs = float(getattr(spec, "scale", 1.0)) or 1.0
+        mesh_info = None
         if spec.mesh_uniform:
             gmsh.option.setNumber("Mesh.MeshSizeMax", spec.mesh_size / fs)
             gmsh.option.setNumber("Mesh.MeshSizeMin", spec.mesh_size / fs)
@@ -1097,6 +1107,54 @@ def build_mesh_3d(spec, msh_path: str, verbose: bool = False,
             gmsh.option.setNumber("Mesh.MeshSizeMin", hmin / fs)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
+        # ---- graded refinement at the metal edges ---------------------------
+        # WHY EDGES AND NOT VOLUME. The operating mode is broad and smooth in the
+        # open gaps between bars -- that is where the stored energy is, and it
+        # needs almost no resolution. What needs resolution is the RE-ENTRANT
+        # EDGES of the bars, where the field has an r^(-1/3) singularity and
+        # where a uniform mesh spends its error budget badly.
+        #
+        # That error is not just inaccuracy here, it is symmetry breaking: a
+        # 5-cell toaster holds its transverse modes within ~0.2% of one another,
+        # so a mesh whose per-cell error exceeds 0.2% detunes the cells against
+        # each other and the in-phase operating mode decouples into localised
+        # ones (form factor collapses to ~0). Grading buys accuracy exactly where
+        # the asymmetry is generated, at a fraction of the element count.
+        edge_field = None
+        if (getattr(spec, "refine_edges", False) and metal and not
+                spec.mesh_uniform):
+            mcurves = set()
+            for t in metal:
+                for (dd, c) in gmsh.model.getBoundary([(2, t)], combined=False,
+                                                      oriented=False):
+                    if dd == 1:
+                        mcurves.add(abs(c))
+            if mcurves:
+                h_max = spec.mesh_size / fs
+                h_min = ((spec.mesh_size_min or spec.mesh_size / 4.0) / fs)
+                d_far = ((spec.refine_dist or 3.0 * spec.mesh_size) / fs)
+                fd = gmsh.model.mesh.field.add("Distance")
+                gmsh.model.mesh.field.setNumbers(fd, "CurvesList",
+                                                 sorted(mcurves))
+                gmsh.model.mesh.field.setNumber(fd, "Sampling", 200)
+                ft = gmsh.model.mesh.field.add("Threshold")
+                gmsh.model.mesh.field.setNumber(ft, "InField", fd)
+                gmsh.model.mesh.field.setNumber(ft, "SizeMin", h_min)
+                gmsh.model.mesh.field.setNumber(ft, "SizeMax", h_max)
+                gmsh.model.mesh.field.setNumber(ft, "DistMin", h_min)
+                gmsh.model.mesh.field.setNumber(ft, "DistMax", d_far)
+                gmsh.model.mesh.field.setAsBackgroundMesh(ft)
+                # the field must be the ONLY source of element size, or gmsh's
+                # boundary-driven sizing overrides it and the grading vanishes
+                gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+                edge_field = ft
+                if verbose:
+                    print(f"[mesh3d] edge grading on {len(mcurves)} metal curves:"
+                          f" {h_min*fs*1e3:.2f} mm at the edges -> "
+                          f"{h_max*fs*1e3:.2f} mm at {d_far*fs*1e3:.1f} mm away",
+                          flush=True)
+
         # ---- runaway guard -------------------------------------------------
         # THE most common way to hang this solver is a mesh_size copied from an
         # example built for a different-sized part. Element count goes as
@@ -1107,7 +1165,28 @@ def build_mesh_3d(spec, msh_path: str, verbose: bool = False,
         bb = gmsh.model.getBoundingBox(-1, -1)
         vol_bbox = abs((bb[3] - bb[0]) * (bb[4] - bb[1]) * (bb[5] - bb[2]))
         h_file = spec.mesh_size / fs
+        if mesh_info is not None:
+            # A GRADED mesh is nowhere near mesh_size on average. Calibrated
+            # against a real run (hmin 0.1 mm, hmax 5 mm -> 4.9M tets where the
+            # coarse-size estimate said 150k, a 33x miss that let the guard wave
+            # through a mesh which then took 214 s and 7.5M dofs):
+            #     h_eff = hmin^(1/3) * hmax^(2/3)
+            # predicts 7.5M there, which is the right order and errs high.
+            h_file = ((mesh_info["hmin"] / fs) ** (1.0 / 3.0) *
+                      (mesh_info["hmax"] / fs) ** (2.0 / 3.0))
         n_est = estimate_elements(vol_bbox, h_file)
+        if mesh_info is not None:
+            ratio = mesh_info["hmax"] / max(mesh_info["hmin"], 1e-30)
+            if ratio > 20:
+                print(f"[mesh3d] WARNING: mesh_size/mesh_size_min = {ratio:.0f}. "
+                      f"A refinement ratio above ~20 rarely buys accuracy and "
+                      f"explodes the element count; {mesh_info['hmin']*1e3:.3f} mm "
+                      f"features need a reason to exist.", flush=True)
+        if edge_field is not None:
+            # graded meshes carry more elements than the coarse size implies;
+            # empirically a few times, so budget for it rather than sailing past
+            # the guard and hanging anyway
+            n_est *= 4.0
         if verbose:
             print(f"[mesh3d] bbox {vol_bbox:.4g} (file units)^3, h = {h_file:.4g}"
                   f" -> ~{n_est:,.0f} tets (estimate)", flush=True)
@@ -1258,18 +1337,22 @@ def _assemble(mesh, element, spec, diel_mats):
     if "background" not in sub:
         raise ValueError("the mesh has no 'background' volume group; it was not "
                          "written by build_mesh_3d.")
-    K = asm(_curlcurl, Basis(mesh, element, elements=sub["background"])) \
-        * (1.0 / spec.background.mu_r)
-    M = asm(_vmass, Basis(mesh, element, elements=sub["background"])) \
-        * spec.background.eps_r
+    # Build each region basis ONCE and hand it back: at 5M tets a single N0 Basis
+    # is several GB of quadrature-point arrays, so constructing a fresh one for
+    # the observables afterwards is what drives RAM to 80% and stalls.
+    bg = Basis(mesh, element, elements=sub["background"])
+    region_bases = [(bg, spec.background)]
+    K = asm(_curlcurl, bg) * (1.0 / spec.background.mu_r)
+    M = asm(_vmass, bg) * spec.background.eps_r
     for i, mat in enumerate(diel_mats):
         key = f"diel_{i}"
         if key not in sub:
             continue
         b = Basis(mesh, element, elements=sub[key])
+        region_bases.append((b, mat))
         K = K + asm(_curlcurl, b) * (1.0 / mat.mu_r)
         M = M + asm(_vmass, b) * mat.eps_r
-    return basis, K, M
+    return basis, K, M, region_bases
 
 
 def discrete_gradient(mesh):
@@ -1351,52 +1434,83 @@ def _int_curlE2(w):
     return dot(w["cu"], w["cu"])
 
 
-def _observables(mesh, element, basis, u, k0, spec, diel_mats, axis="z"):
-    """Form factor C, quality factor Q, volume, and a localisation diagnostic.
+def observable_bases(mesh, element, spec, diel_mats, region_bases=None):
+    """
+    Build the volume and boundary bases used by _observables -- ONCE.
 
-    axis : the CAVITY AXIS, "x" / "y" / "z". C projects onto this component."""
+    THIS IS THE FIX FOR THE HANG. A skfem Basis materialises basis-function
+    values (and their curls) at every quadrature point of every element: for N0
+    on a million tetrahedra that is hundreds of megabytes of temporaries. The
+    previous version constructed one volume Basis and two FacetBasis objects
+    INSIDE _observables, which runs once per mode -- so asking for 50 modes
+    rebuilt them 150 times, spending minutes in allocation and driving RAM to
+    the point of swapping. Nothing about them depends on the mode, so they are
+    hoisted out here and reused.
+
+    Returns (volume_bases, facet_bases) as lists of (Basis, Material).
+    """
+    sub = mesh.subdomains or {}
+    bnd = mesh.boundaries or {}
+    if region_bases is not None:
+        vol = list(region_bases)            # reuse what _assemble already built
+    else:
+        regions = [("background", spec.background)] + \
+                  [(f"diel_{i}", m) for i, m in enumerate(diel_mats)]
+        vol = [(Basis(mesh, element, elements=sub[k]), mat)
+               for k, mat in regions if k in sub]
+    fac = [(FacetBasis(mesh, element, facets=bnd[k]), mat)
+           for k, mat in (("wall", spec.wall_material),
+                          ("metal", spec.metal_material)) if k in bnd]
+    return vol, fac
+
+
+def _observables(vol_bases, fac_bases, u, k0, axis="z"):
+    """
+    Form factor C, quality factor Q, volume, localisation -- for ONE mode, using
+    bases prepared by observable_bases().
+
+    Returns (obs_dict, scale) where `scale` renormalises u to peak |E| = 1.
+
+    NOTE ON NORMALISATION. Everything is integrated on the RAW eigenvector and
+    rescaled afterwards, rather than normalising u first and integrating again.
+    C, Q and the localisation are all ratios of equal powers of |E| and so are
+    scale-INVARIANT; only the absolute energies are not. That removes a second
+    full-mesh interpolation pass per mode, which at 50 modes is not a rounding
+    error.
+    """
     iax = AXIS_INDEX[str(axis).lower()]
     num = den = vol = l2 = l4 = 0.0
-    sub = mesh.subdomains or {}
-    regions = [("background", spec.background)] + \
-              [(f"diel_{i}", m) for i, m in enumerate(diel_mats)]
-    for key, mat in regions:
-        if key not in sub:
-            continue
-        b = Basis(mesh, element, elements=sub[key])
+    peak2 = 0.0
+    for b, mat in vol_bases:
         uh = b.interpolate(u)
         num += _int_Eaxis.assemble(b, uh=uh, iax=iax)
         den += _int_eps_E2.assemble(b, uh=uh, eps=mat.eps_r)
         vol += _volume.assemble(b, uh=uh)
         l2 += _int_E2.assemble(b, uh=uh)
         l4 += _int_E4.assemble(b, uh=uh)
+        mag2 = sum(np.asarray(uh[c]) ** 2 for c in range(3))
+        peak2 = max(peak2, float(np.max(mag2)))
 
     C = (num ** 2) / (vol * den) if vol > 0 and den > 0 else 0.0
-
-    # participation volume: (int|E|^2)^2 / int|E|^4 -- equals the volume for a
-    # uniform field, collapses for a localised one
     V_part = (l2 ** 2) / l4 if l4 > 0 else 0.0
 
-    # Q from wall currents. At a PEC surface H has no normal component, so
-    # |H_t| = |H| = |curl E|/(omega mu0 mu_r) there and no projection is needed.
     omega = C0 * k0
     P = 0.0
-    bnd = mesh.boundaries or {}
-    for key, mat in (("wall", spec.wall_material), ("metal", spec.metal_material)):
-        if key not in bnd:
-            continue
-        fb = FacetBasis(mesh, element, facets=bnd[key])
+    for fb, mat in fac_bases:
         uh = fb.interpolate(u)
         g2 = _int_curlE2.assemble(fb, cu=curl(uh))
         R_s = np.sqrt(omega * MU0 / (2.0 * mat.sigma))
         P += 0.5 * R_s * g2 / (omega * MU0) ** 2
-    U = 0.5 * EPS0 * den
-    Q = (omega * U / P) if P > 0 else np.inf
+    Q = (omega * (0.5 * EPS0 * den) / P) if P > 0 else np.inf
 
-    return dict(C=float(C), Q=float(Q), volume=float(vol), V_part=float(V_part),
-                localisation=float(V_part / vol) if vol else 0.0,
-                int_eps_E2=float(den), U_stored=float(U),
-                int_Eaxis=float(num), axis=str(axis).lower())
+    scale = (1.0 / np.sqrt(peak2)) if peak2 > 0 else 1.0
+    den_n = den * scale ** 2
+    return (dict(C=float(C), Q=float(Q), volume=float(vol),
+                 V_part=float(V_part * scale ** 0),
+                 localisation=float(V_part / vol) if vol else 0.0,
+                 int_eps_E2=float(den_n), U_stored=float(0.5 * EPS0 * den_n),
+                 int_Eaxis=float(num * scale), axis=str(axis).lower()),
+            float(scale))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1514,7 +1628,7 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
             f"fem_solve_3d.diagnose_import(spec) to see what did come in.")
 
     element = ElementTetN0() if element is None else element
-    basis, K, M = _assemble(mesh, element, spec, diel_mats)
+    basis, K, M, region_bases = _assemble(mesh, element, spec, diel_mats)
     pg(f"assembled: {basis.N:,} edge dofs")
     if check_kernel:
         check_gradient_kernel(mesh, K)
@@ -1586,13 +1700,21 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
             except Exception:
                 pass
 
+    # release everything the observables do not need BEFORE touching them: at
+    # 4M dofs K, M and their constrained copies are several GB between them
+    del Kc, Mc, K, M
+    if deflate:
+        del A, S, Gc
     order = np.argsort(np.real(vals))
     out = {"freqs": [], "modes": [], "n_dofs": int(basis.N),
            "n_elements": int(mesh.t.shape[1]), "n_free": int(len(I)),
            "kernel_dim": int(kernel_dim), "tag": spec.tag,
            "deflated": bool(deflate)}
     f_floor = drop_below * (f_target or 0.0)
-    for idx in order:
+    vol_bases, fac_bases = observable_bases(mesh, element, spec, diel_mats,
+                                            region_bases=region_bases)
+    pg(f"observable bases built (reused for all {len(order)} modes)")
+    for _n, idx in enumerate(order):
         lam = float(np.real(vals[idx]))
         if lam <= 0:
             continue
@@ -1600,19 +1722,19 @@ def solve_cavity_3d(spec, n_modes: int = 6, f_target: float | None = None,
         f = C0 * k0 / (2 * np.pi)
         if f < f_floor:
             continue                      # kernel residue, only when not deflated
+        if idx == 0:
+            pg(f"first frequency: {f/1e9:.4f} GHz")
         u = np.zeros(basis.N)
         u[I] = np.real(vecs[:, idx])
-        # normalise to peak |E| = 1 over the quadrature points, mirroring the 2D
-        # convention (the eigenproblem is homogeneous, so scale is a choice)
-        uh = basis.interpolate(u)
-        peak = float(np.sqrt(np.max(sum(np.asarray(uh[c]) ** 2 for c in range(3)))))
-        if peak > 0:
-            u = u / peak
-        obs = _observables(mesh, element, basis, u, k0, spec, diel_mats, axis=axis)
+        obs, scale = _observables(vol_bases, fac_bases, u, k0, axis=axis)
+        u *= scale          # peak |E| = 1, matching the 2D convention
         out["freqs"].append(f)
         out["modes"].append(obs)
         if keep_fields:
             out.setdefault("fields", []).append(u.copy())
+        if progress and progress_every and (_n + 1) % max(1, progress_every // 5) == 0:
+            pg(f"observables: {_n + 1}/{len(order)} modes "
+               f"(f={f/1e9:.4f} GHz, C={obs['C']:.4f})")
     if keep_fields:
         out["mesh"] = mesh
         out["element"] = element
@@ -1722,11 +1844,20 @@ def nodal_field(result, i=0, min_localisation=None):
         i = max(cand, key=lambda j: result["modes"][j]["C"])
     mesh = result["mesh"]
     element = result.get("element") or ElementTetN0()
-    nb = Basis(mesh, element, intorder=2)
-    pb = Basis(mesh, ElementTetP1(), intorder=2)
+    # CACHE. The P1 mass matrix and its factorisation depend only on the mesh,
+    # but plot_modes_3d(n=50) calls this once per mode -- so without the cache it
+    # assembles and LU-factorises the same matrix fifty times. That was the other
+    # half of the "hangs while computing C and Q" report: the hang was in the
+    # PLOTTING, after the solve had finished.
+    cache = result.get("_p1_proj")
+    if cache is None:
+        nb = Basis(mesh, element, intorder=2)
+        pb = Basis(mesh, ElementTetP1(), intorder=2)
+        Mp = asm(BilinearForm(lambda u, v, w: u * v), pb)
+        cache = (nb, pb, splu(Mp.tocsc()))
+        result["_p1_proj"] = cache
+    nb, pb, Mlu = cache
     uh = nb.interpolate(result["fields"][i])
-    Mp = asm(BilinearForm(lambda u, v, w: u * v), pb)
-    Mlu = splu(Mp.tocsc())
     comps = []
     for c in range(3):
         @LinearForm
@@ -1747,6 +1878,8 @@ def _worker(args):
         out = solve_cavity_3d(spec, n_modes=n_modes, f_target=f_target,
                               keep_fields=keep_fields, deflate=deflate)
         out.pop("element", None)          # not needed downstream, keeps pickles small
+        for k in [k for k in out if k.startswith("_")]:
+            out.pop(k)                    # splu objects are not picklable
         return {"ok": True, **out}
     except Exception as e:
         return {"ok": False, "tag": spec.tag, "error": f"{type(e).__name__}: {e}"}

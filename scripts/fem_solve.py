@@ -200,38 +200,168 @@ def CRect(cx, cy, w, h, name="rect", angle=0.0):
 @dataclass
 class CavitySpec:
     """
-    outer       : the cavity cross-section.
-    metal       : rectangles CUT OUT of the cavity (setminus). Their walls become
-                  boundary condition surfaces. This is where your toasts/dividers go.
-    dielectric  : (Rect, Material) kept in the mesh as distinct material regions.
-    wall_material / metal_material : conductors used for the Q surface integral on
-                  the outer wall and on the cut-out boundaries respectively.
-    background  : material filling the rest of the cavity (vacuum by default).
-    mesh_size   : target element size (m). mesh_size_min defaults to mesh_size/3.
+    Specification for a 2D cavity cross-section.
+
+    Parameters
+    ----------
+    outer
+        The cavity cross-section.
+
+    metal
+        Rectangles CUT OUT of the cavity (setminus). Their new boundaries
+        become PEC / impedance-boundary surfaces. These are the toaster
+        bars/dividers.
+
+    dielectric
+        List of (Rect, Material) pairs kept inside the mesh as separate,
+        conformal material regions.
+
+    background
+        Material filling the rest of the cavity. Vacuum by default.
+
+    wall_material
+        Conductor used when computing wall loss on the outer cavity boundary.
+
+    metal_material
+        Conductor used when computing loss on the boundaries of the cut-out
+        metal rectangles.
+
+    mesh_size
+        Nominal / maximum element size in metres.
+
+    mesh_size_min
+        Minimum element size in metres.
+
+        With mesh_adaptive=False this retains the OLD 2D behavior:
+        elements may shrink to this size because of Gmsh's ordinary
+        geometry/boundary sizing rules.
+
+        With mesh_adaptive=True this becomes the LOCAL minimum size near
+        selected geometry, while mesh_size is the bulk / maximum size.
+
+        If None, downstream code defaults this to mesh_size / 3.
+
+    mesh_uniform
+        If True, force a genuinely uniform mesh with
+
+            Mesh.MeshSizeMin = Mesh.MeshSizeMax = mesh_size
+
+        and disable automatic point/boundary size effects.
+
+        This is useful for controlled convergence studies.
+
+    mesh_adaptive
+        If True, request a spatially varying mesh-size field.
+
+        In the 3D solver this means that the mesh is refined near the
+        metal surfaces/edges rather than using mesh_size_min everywhere.
+
+        In the 2D solver, build_mesh() must be updated separately if you
+        want the same adaptive behavior in 2D. The parameters are stored
+        here primarily so that from_2d() can propagate them to the 3D spec.
+
+    mesh_refine_distance
+        Characteristic distance over which the local mesh transitions from
+        mesh_size_min near metal geometry back to mesh_size.
+
+        Units: metres.
+
+        For example:
+
+            mesh_size = 0.004
+            mesh_size_min = 0.001
+            mesh_refine_distance = 0.006
+
+        means approximately 1 mm elements close to the metal, gradually
+        growing toward 4 mm elements over about 6 mm.
+
+    mesh_refine_surfaces
+        When adaptive meshing is used in 3D, refine based on metal surfaces.
+
+    mesh_refine_edges
+        When adaptive meshing is used in 3D, also refine near edges of the
+        metal surfaces. This is particularly useful for the sharp corners
+        of the toaster wedges.
+
+    tag
+        Free-form label carried through to the solver results.
     """
     outer: Rect
     metal: list = field(default_factory=list)
     dielectric: list = field(default_factory=list)
-    background: Material = field(default_factory=lambda: Material("vacuum"))
-    wall_material: Material = field(default_factory=lambda: Material("cu"))
-    metal_material: Material = field(default_factory=lambda: Material("cu"))
-    mesh_size: float = 0.004
-    mesh_size_min: float | None = None
-    mesh_uniform: bool = False   # see build_mesh: pin every element to mesh_size
-    tag: str = ""            # free-form label carried through to the results
 
-    # ---- outer-shape hooks: everything else in build_mesh is shape-agnostic --
+    background: Material = field(
+        default_factory=lambda: Material("vacuum")
+    )
+
+    wall_material: Material = field(
+        default_factory=lambda: Material("cu")
+    )
+
+    metal_material: Material = field(
+        default_factory=lambda: Material("cu")
+    )
+
+    # ------------------------------------------------------------------
+    # Mesh controls
+    # ------------------------------------------------------------------
+
+    # Bulk / nominal element size in metres.
+    mesh_size: float = 0.004
+
+    # Local minimum element size in metres.
+    # None means mesh_size / 3 in the downstream mesh builder.
+    mesh_size_min: float | None = None
+
+    # Force a uniform mesh when True.
+    mesh_uniform: bool = False
+
+    # Enable spatially varying mesh refinement.
+    mesh_adaptive: bool = False
+
+    # Distance over which the adaptive mesh grows from mesh_size_min
+    # to mesh_size. Units: metres.
+    mesh_refine_distance: float = 0.006
+
+    # Which parts of the metal geometry should drive adaptive refinement.
+    mesh_refine_surfaces: bool = True
+    mesh_refine_edges: bool = True
+
+    # Free-form label carried through to the results.
+    tag: str = ""
+
+    # ------------------------------------------------------------------
+    # Outer-shape hooks: build_mesh() is otherwise shape-agnostic.
+    # ------------------------------------------------------------------
+
     def add_outer(self, occ):
-        """Create the outer surface and return its tag."""
+        """Create the outer surface and return its Gmsh entity tag."""
         return occ.addRectangle(*self.outer.as_tuple())
 
     def on_wall(self, pts):
-        """True if every sampled point of a curve lies on the OUTER boundary."""
+        """
+        Return True if every sampled point of a boundary curve lies on the
+        OUTER cavity boundary.
+
+        This distinguishes the cavity wall from boundaries created by
+        cutting out the metal rectangles.
+        """
         x0, y0, x1, y1 = self.outer.bounds
-        tol = _BBOX_TOL + 1e-6 * max(self.outer.w, self.outer.h)
-        x, y = pts[:, 0], pts[:, 1]
-        return bool(np.all(np.abs(x - x0) < tol) or np.all(np.abs(x - x1) < tol) or
-                    np.all(np.abs(y - y0) < tol) or np.all(np.abs(y - y1) < tol))
+
+        tol = _BBOX_TOL + 1e-6 * max(
+            self.outer.w,
+            self.outer.h,
+        )
+
+        x = pts[:, 0]
+        y = pts[:, 1]
+
+        return bool(
+            np.all(np.abs(x - x0) < tol)
+            or np.all(np.abs(x - x1) < tol)
+            or np.all(np.abs(y - y0) < tol)
+            or np.all(np.abs(y - y1) < tol)
+        )
 
     @property
     def extent(self):

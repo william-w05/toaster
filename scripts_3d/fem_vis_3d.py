@@ -49,7 +49,7 @@ matplotlib.use("Agg")          # safe headless; remove for interactive matplotli
 import matplotlib.pyplot as plt
 
 try:                                    # inside the package
-    from . import fem_solve_3d as cv3
+    from . import fem_solve_3d_updated as cv3
     from scripts import fem_solve as cv2
 except ImportError:                     # standalone / notebook
     import fem_solve_3d as cv3

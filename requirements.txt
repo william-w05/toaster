@@ -10,3 +10,4 @@ pandas
 PyQt6
 pyvista[jupyter]
 pypardiso
+ngsolve
